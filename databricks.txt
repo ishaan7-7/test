@@ -1,0 +1,400 @@
+undestand this robot class well only understand:
+from pyspark.sql import functions as F
+
+class Robot:
+    def __init__(self, box, maximo):
+        self.box = box
+        self.maximo = maximo
+
+    # -----------------------------------------------------
+    # Step 1: Filter Robot-related data
+    # -----------------------------------------------------
+    def filter_data(self, box_df, maximo_df):
+        # Keep only robot-type equipment in both datasets
+        box_df = box_df.filter(F.col("equipment_type").isin(["Robot"]))
+
+        # Clean Maximo 'description' to ensure consistent match patterns
+        maximo_df = (
+            maximo_df
+            .withColumn("description", F.regexp_replace("description", r" ROBOT CONTROLLER", "ROBOT CONTROLLER-"))
+            .filter(F.col("description").contains("ROBOT CONTROLLER-"))
+        )
+
+        return box_df, maximo_df
+
+    # -----------------------------------------------------
+    # Step 2: Perform join between Box and Maximo data
+    # -----------------------------------------------------
+    def join_data(self, box_df, maximo_df, box_join_column, maximo_join_column, join_type='left'):
+        # Example: first match uses Box.name ↔ Maximo.cleaned
+        return box_df.join(maximo_df, box_df[box_join_column] == maximo_df[maximo_join_column], join_type)
+
+    # -----------------------------------------------------
+    # Step 3: Get unmatched data from Box side
+    # -----------------------------------------------------
+    def get_unmatched(self, box_result_df, box_df, join_column='id', join_type='left_anti'):
+        return box_df.join(box_result_df, box_df[join_column] == box_result_df[join_column], join_type)
+
+    # -----------------------------------------------------
+    # Step 4: Main matching workflow
+    # -----------------------------------------------------
+    def get_results(self, printout=False):
+        # Step 1 — filter relevant data
+        box_df, maximo_df = self.filter_data(self.box, self.maximo)
+
+        # Step 2 — initial match (by Box 'name' vs Maximo 'cleaned')
+        initial_match_all = self.join_data(box_df, maximo_df, 'name', 'cleaned')
+        initial_match_result = initial_match_all.filter(F.col("cleaned").isNotNull())
+
+        # Step 3 — get unmatched robots
+        initial_non = self.get_unmatched(initial_match_result, box_df)
+
+        # Step 4 — second match (try again using Box 'equipment_name' vs Maximo 'cleaned')
+        second_match_all = self.join_data(initial_non, maximo_df, 'equipment_name', 'cleaned')
+        second_match_result = second_match_all.filter(F.col("cleaned").isNotNull())
+
+        # Step 5 — combine both matched results
+        total_matched = initial_match_result.union(second_match_result)
+
+        # Step 6 — find final unmatched robots (not matched in either round)
+        total_unmatched = (
+            initial_non.alias("initial")
+            .join(second_match_result.alias("second"), F.col("initial.id") == F.col("second.id"), 'left_anti')
+        )
+
+        # Step 7 — optional progress printing
+        if printout:
+            print(f"Initially matched ROBOTS: {initial_match_result.count()} / {initial_match_all.count()} "
+                  f"({100 * initial_match_result.count() / initial_match_all.count():.2f}%)")
+
+            print("Initially unmatched ROBOTS:", initial_non.count())
+
+            print("Additional matched ROBOTS after second matching round:", second_match_result.count())
+
+            print(f"Total unique matched ROBOTS: "
+                  f"{total_matched.dropDuplicates(['id']).count()} / {box_df.count()} "
+                  f"({100 * total_matched.dropDuplicates(['id']).count() / box_df.count():.2f}%)")
+
+            print(f"Total unique unmatchable ROBOTS: "
+                  f"{total_unmatched.dropDuplicates(['id']).count()} "
+                  f"({100 * total_unmatched.dropDuplicates(['id']).count() / box_df.count():.2f}%)")
+
+        return total_matched, total_unmatched
+
+
+
+now understand and just understand in the same way this process class:
+import builtins
+import numpy as np
+import datetime
+from pyspark.sql import functions as F
+from pyspark.sql.window import Window
+from pyspark.sql.types import FloatType
+
+
+class Process:
+    def __init__(self, spark, box, maximo):
+        self.spark = spark
+        self.box = box
+        self.maximo = maximo
+
+        # Predefined weights per segment
+        self.weights = [1e-1, 1e-2, 1e-3, 1e-4, 1e-5, 1e-6, 1e-7, 1e-8, 1e-9]
+
+        # Parsed name segments
+        self.cols = [
+            "zone", "sub_zone", "station_number", "item", "item_number",
+            "process", "process_number", "plant_group", "plant_group_number"
+        ]
+
+        # Supported equipment types
+        self.equipment_types = ["Robot", "Dispense", "Weld", "Cylinder", "VFD", "Controller", "Camera"]
+
+        self.results = {}
+
+        # Run initial matching for all equipment types
+        for eq in self.equipment_types:
+            eq_class = globals()[eq]()  # dynamically instantiate Robot(), Dispense(), etc.
+            box_df, maximo_df = eq_class.filter_data(self.box, self.maximo)
+            matched, unmatched = eq_class.get_results()
+            w = self.all_costs(maximo_df)
+            w_broadcast = self.spark.sparkContext.broadcast(w)
+
+            self.results[eq] = {
+                "eq_class": eq_class,
+                "box_df": box_df,
+                "maximo_df": maximo_df,
+                "matched": matched,
+                "unmatched": unmatched,
+                "w_broadcast": w_broadcast
+            }
+
+    # ------------------------------------------------------------------
+    # Split equipment names into structural parts
+    # ------------------------------------------------------------------
+    def separate_segments(self, unmatched_df):
+        regex_pattern = r"^([A-Z]{2})(\d{3})([RT]?\d{2})?([PX]?\d)?(B\d{2})?"
+        target_col = F.coalesce(F.col("equipment_name"), F.col("name"))
+
+        return (
+            unmatched_df
+            .withColumn("zone", F.substring(F.regexp_extract(target_col, regex_pattern, 1), 1, 1))
+            .withColumn("sub_zone", F.substring(F.regexp_extract(target_col, regex_pattern, 1), 2, 1))
+            .withColumn("station_number", F.regexp_extract(target_col, regex_pattern, 2))
+            .withColumn("item", F.substring(F.regexp_extract(target_col, regex_pattern, 3), 1, 1))
+            .withColumn("item_number", F.substring(F.regexp_extract(target_col, regex_pattern, 3), 2, 2))
+            .withColumn("process", F.substring(F.regexp_extract(target_col, regex_pattern, 4), 1, 1))
+            .withColumn("process_number", F.substring(F.regexp_extract(target_col, regex_pattern, 4), 2, 1))
+            .withColumn("plant_group", F.substring(F.regexp_extract(target_col, regex_pattern, 5), 1, 1))
+            .withColumn("plant_group_number", F.substring(F.regexp_extract(target_col, regex_pattern, 5), 2, 2))
+        )
+
+    # ------------------------------------------------------------------
+    # Compute cost weights (deletion/insertion/substitution)
+    # ------------------------------------------------------------------
+    def all_costs(self, maximo_df):
+        total = maximo_df.count()
+        proportions = {c: maximo_df.filter(F.col(c).isNull()).count() / total for c in self.cols}
+
+        entropy = {}
+        for c in self.cols:
+            freq = maximo_df.groupBy(c).agg(F.count("*").alias("count"))
+            freq = freq.withColumn("prob", F.col("count") / total)
+            freq = freq.withColumn("info", F.col("prob") * F.log2(F.col("prob")))
+            e = -freq.agg(F.sum("info")).collect()[0][0]
+            entropy[c] = np.abs(e)
+
+        deletion_costs = {k: 3 * v for k, v in proportions.items()}
+        insertion_costs = {k: 3 * v for k, v in proportions.items()}
+        substitution_costs = entropy
+
+        return {
+            segment: {
+                "weight": weight,
+                "D": deletion_costs[segment],
+                "I": insertion_costs[segment],
+                "S": substitution_costs[segment],
+            }
+            for segment, weight in zip(deletion_costs.keys(), self.weights)
+        }
+
+    # ------------------------------------------------------------------
+    # Create distance table between Box and Maximo equipment
+    # ------------------------------------------------------------------
+    def create_distance_table(self, box_df, maximo_df, top_matches=50):
+        # 1️⃣ Parse Box equipment name into segments
+        unmatched_box_df = self.separate_segments(box_df)
+
+        # 2️⃣ Compute cost parameters
+        w = self.all_costs(maximo_df)
+
+        # 3️⃣ Create custom Levenshtein UDF with weighted cost logic
+        distance_udf = self.total_distance_udf_factory(w)
+
+        # 4️⃣ Rename maximo_df columns for distinction
+        renamed_maximo_df = maximo_df.select(
+            *[F.col(c).alias(f"{c}_maximo") if c in self.cols else F.col(c) for c in maximo_df.columns]
+        )
+
+        # 5️⃣ Cartesian join (compare every unmatched Box record with every Maximo record)
+        cross_join_df = unmatched_box_df.crossJoin(renamed_maximo_df)
+
+        # 6️⃣ Compute weighted distance per row
+        cross_join_df = cross_join_df.withColumn(
+            "weighted_distance",
+            distance_udf(
+                *[F.col(c).cast("string") for c in self.cols],
+                *[F.col(f"{c}_maximo").cast("string") for c in self.cols]
+            )
+        )
+
+        # 7️⃣ Normalize score (convert distance to similarity)
+        cross_join_df = cross_join_df.withColumn("weighted_distance", 1 - F.col("weighted_distance"))
+
+        # 8️⃣ Rank best matches within each Box id
+        window_spec = Window.partitionBy("id").orderBy(F.col("weighted_distance").desc())
+        filtered_df = (
+            cross_join_df
+            .withColumn("rank", F.row_number().over(window_spec))
+            .filter(F.col("rank") <= top_matches)
+        )
+
+        return filtered_df
+
+    # ------------------------------------------------------------------
+    # Combine all equipment results
+    # ------------------------------------------------------------------
+    def combine_data(self):
+        matched_list = [data["matched"] for data in self.results.values() if data["matched"] is not None]
+        unmatched_list = [data["unmatched"] for data in self.results.values() if data["unmatched"] is not None]
+
+        matched_df = matched_list[0]
+        unmatched_df = unmatched_list[0]
+
+        for df in matched_list[1:]:
+            matched_df = matched_df.union(df)
+
+        for df in unmatched_list[1:]:
+            unmatched_df = unmatched_df.union(df)
+
+        return matched_df, unmatched_df
+
+    # ------------------------------------------------------------------
+    # Create weighted Levenshtein UDF
+    # ------------------------------------------------------------------
+    def total_distance_udf_factory(self, w):
+        @F.udf(FloatType())
+        def distance_udf(*args):
+            if not args or len(args) % 2 != 0:
+                return float("nan")
+
+            num_cols = len(w.keys())
+            box_values = args[:num_cols]
+            maximo_values = args[num_cols:]
+
+            def custom_levenshtein(val1, val2, col_name):
+                val1 = str(val1) if val1 else ""
+                val2 = str(val2) if val2 else ""
+
+                len_v1, len_v2 = len(val1), len(val2)
+                dp = np.zeros((len_v1 + 1, len_v2 + 1))
+
+                for i in range(1, len_v1 + 1):
+                    dp[i][0] = dp[i - 1][0] + w[col_name]["D"]
+                for j in range(1, len_v2 + 1):
+                    dp[0][j] = dp[0][j - 1] + w[col_name]["I"]
+
+                for i in range(1, len_v1 + 1):
+                    for j in range(1, len_v2 + 1):
+                        char1, char2 = val1[i - 1], val2[j - 1]
+                        cost_sub = 0 if char1 == char2 else w[col_name]["S"]
+                        dp[i][j] = builtins.min(
+                            dp[i - 1][j] + w[col_name]["D"],
+                            dp[i][j - 1] + w[col_name]["I"],
+                            dp[i - 1][j - 1] + cost_sub
+                        )
+
+                max_len = builtins.max(len_v1, len_v2)
+                return (w[col_name]["weight"] * dp[len_v1][len_v2] / max_len) if max_len > 0 else 0
+
+            try:
+                total_distance = builtins.sum(
+                    custom_levenshtein(box, maximo, col)
+                    for box, maximo, col in zip(box_values, maximo_values, w.keys())
+                )
+                return float(total_distance)
+            except Exception as e:
+                print(f"ERROR in distance computation: {e}")
+                return float("nan")
+
+        return distance_udf
+
+
+Now this is the final code using both robot and process class so understand it well also:
+from functools import reduce
+from pyspark.sql import DataFrame
+from pyspark.sql import functions as F
+import datetime
+
+# --- Define column order (cleaned) ---
+column_order = [
+    "id", "name", "description_box", "equipment_type", "plant_id", "location_address",
+    "host_name", "device_name_box", "data_source", "pic", "program", "equipment_name",
+    "zone", "sub_zone", "station_number", "item", "item_number", "process", "process_number",
+    "plant_group", "plant_group_number", "assetnum", "location", "description", "gmassettype",
+    "gmtoolno", "gmstation", "gmmaintainer", "gmmecenter", "status", "siteid", "manufacturer",
+    "zone_maximo", "sub_zone_maximo", "station_number_maximo", "item_maximo", "item_number_maximo",
+    "process_maximo", "process_number_maximo", "plant_group_maximo", "plant_group_number_maximo",
+    "device_name", "cleaned", "provided_by", "buffer", "weighted_distance", "rank"
+]
+
+# --- Prepare results list ---
+results_list = []
+
+# Instantiate Process class (make sure box & maximo are passed if required)
+process = Process(spark)
+
+# Maximo columns corresponding to process.cols
+maximo_cols = [f"{c}_maximo" for c in process.cols]
+
+# Helper function to add missing columns and select in the right order
+def ensure_columns(df, cols):
+    missing_cols = [c for c in cols if c not in df.columns]
+    for c in missing_cols:
+        df = df.withColumn(c, F.lit(None))
+    return df.select(*cols)
+
+# Iterate through all equipment types
+for eq, data in process.results.items():
+    matched_df = data.get("matched")
+    unmatched_df = data.get("unmatched")
+    maximo_df = data.get("maximo_df")
+
+    # --- Handle matched DataFrame ---
+    if matched_df is not None:
+        # Add missing Maximo columns for union
+        for c in maximo_cols:
+            if c not in matched_df.columns:
+                matched_df = matched_df.withColumn(c, F.lit(''))
+        # Set default weighted distance and rank for exact matches
+        matched_df = matched_df.withColumn("weighted_distance", F.lit(1.0))\
+                               .withColumn("rank", F.lit(1))
+        # Reorder and append
+        matched_df = ensure_columns(matched_df, column_order)
+        results_list.append(matched_df)
+
+    # --- Handle unmatched DataFrame (fuzzy matching) ---
+    if unmatched_df is not None and maximo_df is not None:
+        unmatched_box_df = process.separate_segments(unmatched_df)
+        filtered_df = process.create_distance_table(unmatched_box_df, maximo_df).cache()
+
+        print("Current Time:", datetime.datetime.now().strftime("%H:%M:%S"))
+        filtered_df.count()  # materialize to force computation
+
+        # Reorder and append
+        filtered_df = ensure_columns(filtered_df, column_order)
+        results_list.append(filtered_df)
+
+# --- Combine all results ---
+merged_df = None
+if results_list:
+    merged_df = reduce(DataFrame.unionAll, results_list)
+
+    # Create unique ID
+    merged_df = merged_df.withColumn(
+        "unique",
+        F.concat(F.coalesce(F.col("id").cast("string"), F.lit("")),
+                 F.lit("_"),
+                 F.coalesce(F.col("assetnum").cast("string"), F.lit("")))
+    )
+
+    # Compare segment columns and identify differences
+    column_pairs = list(zip(process.cols, maximo_cols))
+    name_differences = [
+        F.when(
+            (F.coalesce(F.col(a).cast("string"), F.lit("")) != F.coalesce(F.col(b).cast("string"), F.lit("")))
+            & (F.coalesce(F.col("weighted_distance"), F.lit(0.0)) < 1.0),
+            F.lit(a)
+        ).otherwise(F.lit(None))
+        for a, b in column_pairs
+    ]
+    merged_df = merged_df.withColumn("name_difference", F.concat_ws(", ", *name_differences))
+
+    # Clean formatting of differences
+    merged_df = merged_df.withColumn(
+        "name_difference",
+        F.initcap(F.regexp_replace(F.col("name_difference"), "_", " "))
+    )
+
+    # Mapping status
+    merged_df = merged_df.withColumn(
+        "mapping_status",
+        F.when(F.trim(F.coalesce(F.col("name_difference"), F.lit(""))) != "", F.lit("Partial"))
+         .otherwise(F.lit("Complete"))
+    )
+
+    # Add timestamp and comment
+    merged_df = merged_df.withColumn("submission_date", F.current_timestamp())\
+                         .withColumn("comment", F.lit(""))
+
+# merged_df now contains unified matched + fuzzy-matched results
