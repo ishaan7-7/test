@@ -1,0 +1,96 @@
+# === Full CSV Compressed Timeline Plot (All Scenarios) ===
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+import matplotlib.dates as mdates
+
+CSV_PATH = r"C:\Users\ishaa\OneDrive\Desktop\synthetic_data_final\synthetic_battery_inference_scenarioA.csv"
+
+# Load only needed columns
+df = pd.read_csv(CSV_PATH, usecols=["timestamp", "composite_score"], low_memory=False)
+df = df.dropna(subset=["timestamp", "composite_score"]).reset_index(drop=True)
+df["timestamp"] = pd.to_datetime(df["timestamp"], utc=True)
+
+# Sort by time (safety)
+df = df.sort_values("timestamp").reset_index(drop=True)
+
+# === Compress timeline by removing gaps > 30 minutes ===
+GAP_MINUTES = 30
+gap_thresh = pd.Timedelta(minutes=GAP_MINUTES)
+
+ts = df["timestamp"]
+diffs = ts.diff().fillna(pd.Timedelta(seconds=0))
+segment_start = diffs > gap_thresh
+segment_id = segment_start.cumsum()
+
+# Build cumulative gap-removal 
+shifts = pd.Series(pd.Timedelta(0), index=df.index)
+prev_end = ts.iloc[0]
+cumulative_shift = pd.Timedelta(0)
+
+for i, (_, g) in enumerate(df.groupby(segment_id)):
+    seg_start = g["timestamp"].iloc[0]
+    seg_end   = g["timestamp"].iloc[-1]
+
+    if i > 0:
+        gap = seg_start - prev_end
+        cumulative_shift += gap
+
+    shifts.loc[g.index] = cumulative_shift
+    prev_end = seg_end
+
+# Add compressed timestamps
+df["shifted_ts"] = df["timestamp"] - shifts.values
+
+# Prepare for resampling
+df_shift = df.set_index("shifted_ts").sort_index()
+
+# 1-minute mean for smoothness (kept behavior but changed 'T' -> 'min' to avoid FutureWarning)
+resampled = df_shift["composite_score"].resample("0.3min").mean().interpolate()
+
+# 1-hour rolling mean
+rolling_1h = resampled.rolling("60min", min_periods=1).mean()
+
+# === Plot (UNCHANGED visuals: compressed timeline used for x) ===
+plt.figure(figsize=(20,6))
+
+plt.scatter(df_shift.index,
+            df_shift["composite_score"],
+            s=4, alpha=0.18, color="tab:blue",
+            label="composite_score (dots)")
+
+plt.plot(rolling_1h.index,
+         rolling_1h.values,
+         color="tab:red", linewidth=2.0,
+         label="1-hour rolling mean")
+
+plt.title("Composite Score — Full CSV (Compressed Timeline Across All Scenarios)")
+plt.xlabel("Compressed time")
+plt.ylabel("Composite Score")
+plt.grid(alpha=0.3)
+plt.legend()
+
+# === FIX X-AXIS LABELS: show REAL date (dd-mm-yy) for each compressed tick ===
+# Build a UNIQUE mapping from shifted_ts -> a representative real timestamp (first occurrence)
+# This ensures the index used for nearest lookup is unique (no InvalidIndexError).
+real_ts_map = df.groupby("shifted_ts")["timestamp"].first().sort_index()  # DatetimeIndex, unique
+
+def format_real_date(x, pos):
+    # x is a Matplotlib float date value corresponding to a shifted_ts
+    try:
+        shifted_dt = mdates.num2date(x)              # returns a datetime.datetime
+        shifted_ts = pd.Timestamp(shifted_dt)       # convert to pandas Timestamp for lookup
+        # find nearest shifted index in real_ts_map (unique index so get_indexer works)
+        idx = real_ts_map.index.get_indexer([shifted_ts], method="nearest")[0]
+        if idx == -1:
+            return ""
+        real_dt = real_ts_map.iloc[idx]
+        return real_dt.strftime("%d-%m-%y")
+    except Exception:
+        return ""
+
+ax = plt.gca()
+ax.xaxis.set_major_formatter(plt.FuncFormatter(format_real_date))
+
+plt.tight_layout()
+plt.show()
