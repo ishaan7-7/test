@@ -94,3 +94,63 @@ ax.xaxis.set_major_formatter(plt.FuncFormatter(format_real_date))
 
 plt.tight_layout()
 plt.show()
+
+
+
+
+# Cell: Composite Score plot + thresholds and saving filtered rows
+
+import pandas as pd
+import matplotlib.pyplot as plt
+from pathlib import Path
+
+CSV_PATH = Path(r"C:\Users\ishaa\OneDrive\Desktop\synthetic_data_final\synthetic_battery_inference_scenarioA.csv")
+OUT_PATH = CSV_PATH.parent / "battery_filtered_above_0_5.csv"
+
+HEALTH_COL = "composite_score"
+KMS_COL = "com_kms"
+
+# Safe load with dtype enforcement
+df = pd.read_csv(CSV_PATH)
+
+required_cols = {HEALTH_COL, KMS_COL}
+missing = required_cols - set(df.columns)
+if missing:
+    raise ValueError(f"Missing required columns: {missing}")
+
+# Sort and rolling mean
+df = df.sort_values(KMS_COL, ignore_index=True)
+df["mean60"] = (
+    df[HEALTH_COL]
+    .astype("float32")
+    .rolling(window=60, min_periods=1)
+    .mean()
+)
+
+# Filtering above threshold
+CRITICAL_THRESHOLD = 0.5
+WARN_THRESHOLD = 0.3
+
+df_crit = df[df[HEALTH_COL] >= CRITICAL_THRESHOLD].copy()
+df_crit.to_csv(OUT_PATH, index=False)
+
+# Plot
+plt.figure(figsize=(15, 5))
+plt.scatter(df[KMS_COL], df[HEALTH_COL], s=1, alpha=0.4, label="raw")
+
+plt.plot(df[KMS_COL], df["mean60"], linewidth=2, label="60-row mean")
+
+# threshold lines (single source of truth)
+plt.axhline(WARN_THRESHOLD, linestyle=":", linewidth=1.5, color="yellow", label="Warn (0.3)")
+plt.axhline(CRITICAL_THRESHOLD, linestyle="--", linewidth=2, color="red", label="Critical (0.5)")
+
+plt.xlabel("Cumulative kms")
+plt.ylabel(HEALTH_COL)
+plt.title(f"{HEALTH_COL} vs cumulative kms")
+plt.grid(True, linestyle="--", alpha=0.3)
+plt.legend()
+plt.tight_layout()
+plt.show()
+
+print(f"Filtered rows saved to: {OUT_PATH}")
+print(f"Rows above {CRITICAL_THRESHOLD} = {len(df_crit)}")
