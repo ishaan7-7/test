@@ -154,3 +154,96 @@ plt.show()
 
 print(f"Filtered rows saved to: {OUT_PATH}")
 print(f"Rows above {CRITICAL_THRESHOLD} = {len(df_crit)}")
+
+
+# Cell 1: Plot with thresholds + first crossing + service marker
+
+import pandas as pd
+import matplotlib.pyplot as plt
+from pathlib import Path
+
+CSV_PATH = Path(r"C:\Users\ishaa\OneDrive\Desktop\synthetic_data_final\synthetic_battery_inference_scenarioA.csv")
+HEALTH_COL = "composite_score"
+KMS_COL = "com_kms"
+TIMESTAMP_COL = "timestamp"
+
+WARN_THRESHOLD = 0.3
+CRITICAL_THRESHOLD = 0.5
+SERVICE_KMS = 11000.0
+
+df = pd.read_csv(CSV_PATH)
+
+# Validation
+required_cols = {HEALTH_COL, KMS_COL, TIMESTAMP_COL}
+missing = required_cols - set(df.columns)
+if missing:
+    raise ValueError(f"Missing required columns: {missing}")
+
+# Sort + rolling
+df = df.sort_values(KMS_COL, ignore_index=True)
+df["mean60"] = (
+    df[HEALTH_COL].astype("float32")
+    .rolling(window=60, min_periods=1)
+    .mean()
+)
+
+# first crossing computation
+df_crit = df[df[HEALTH_COL] >= CRITICAL_THRESHOLD]
+first_crit_kms = None
+first_crit_ts = None
+if not df_crit.empty:
+    first_crit_kms = float(df_crit.iloc[0][KMS_COL])
+    first_crit_ts = str(df_crit.iloc[0][TIMESTAMP_COL])
+
+# --- PLOT ---
+plt.figure(figsize=(15, 5))
+plt.scatter(df[KMS_COL], df[HEALTH_COL], s=1, alpha=0.4, label="raw")
+plt.plot(df[KMS_COL], df["mean60"], linewidth=2, label="60-row mean")
+
+# thresholds
+plt.axhline(WARN_THRESHOLD, linestyle=":", linewidth=1.5, color="yellow", label="Warn 0.3")
+plt.axhline(CRITICAL_THRESHOLD, linestyle="--", linewidth=2, color="red", label="Critical 0.5")
+
+# service marker
+plt.axvline(SERVICE_KMS, linestyle="-.", linewidth=1.5, color="lightgray", label="Service (11,000 km)")
+
+# first critical crossing vertical line
+if first_crit_kms is not None:
+    plt.axvline(first_crit_kms, linestyle=":", linewidth=1.5, color="black",
+                label=f"First ≥0.5 @ {first_crit_ts}")
+
+plt.xlabel("Cumulative kms")
+plt.ylabel(HEALTH_COL)
+plt.title(f"{HEALTH_COL} vs cumulative kms")
+plt.grid(True, linestyle="--", alpha=0.3)
+plt.legend()
+plt.tight_layout()
+plt.show()
+
+if first_crit_kms is not None:
+    print(f"First critical crossing: {first_crit_kms} km, ts={first_crit_ts}")
+else:
+    print("No point crossed 0.5 threshold.")
+
+
+
+
+
+# Cell 2: write filtered CSV (no plotting)
+
+import pandas as pd
+from pathlib import Path
+
+CSV_PATH = Path(r"C:\Users\ishaa\OneDrive\Desktop\synthetic_data_final\synthetic_battery_inference_scenarioA.csv")
+OUT_PATH = CSV_PATH.parent / "battery_filtered_above_0_5.csv"
+
+HEALTH_COL = "composite_score"
+
+df = pd.read_csv(CSV_PATH)
+
+df_filtered = df[df[HEALTH_COL] >= 0.5].copy()
+df_filtered.to_csv(OUT_PATH, index=False)
+
+print("Filtered CSV written:", OUT_PATH)
+print("Rows saved:", len(df_filtered))
+
