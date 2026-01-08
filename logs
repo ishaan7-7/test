@@ -1,0 +1,111 @@
+Before Reset:
+C:\Users\ishaan256185>curl http://127.0.0.1:8000/metrics
+# HELP ingest_requests_total Total number of ingest HTTP requests received
+# TYPE ingest_requests_total counter
+ingest_requests_total 1792.0
+# HELP ingest_requests_created Total number of ingest HTTP requests received
+# TYPE ingest_requests_created gauge
+ingest_requests_created 1.76788455379687e+09
+# HELP ingest_rows_accepted_total Total number of rows accepted for Kafka production
+# TYPE ingest_rows_accepted_total counter
+ingest_rows_accepted_total 1321.0
+# HELP ingest_rows_accepted_created Total number of rows accepted for Kafka production
+# TYPE ingest_rows_accepted_created gauge
+ingest_rows_accepted_created 1.7678845537968898e+09
+# HELP ingest_rows_rejected_total Total number of rows rejected by ingest service
+# TYPE ingest_rows_rejected_total counter
+ingest_rows_rejected_total 471.0
+# HELP ingest_rows_rejected_created Total number of rows rejected by ingest service
+# TYPE ingest_rows_rejected_created gauge
+ingest_rows_rejected_created 1.7678845537969027e+09
+# HELP ingest_validation_latency_ms Schema validation latency in milliseconds
+# TYPE ingest_validation_latency_ms histogram
+ingest_validation_latency_ms_bucket{le="1.0"} 1792.0
+ingest_validation_latency_ms_bucket{le="5.0"} 1792.0
+ingest_validation_latency_ms_bucket{le="10.0"} 1792.0
+ingest_validation_latency_ms_bucket{le="25.0"} 1792.0
+ingest_validation_latency_ms_bucket{le="50.0"} 1792.0
+ingest_validation_latency_ms_bucket{le="100.0"} 1792.0
+ingest_validation_latency_ms_bucket{le="250.0"} 1792.0
+ingest_validation_latency_ms_bucket{le="500.0"} 1792.0
+ingest_validation_latency_ms_bucket{le="1000.0"} 1792.0
+ingest_validation_latency_ms_bucket{le="+Inf"} 1792.0
+ingest_validation_latency_ms_count 1792.0
+ingest_validation_latency_ms_sum 0.08003920043120161
+# HELP ingest_validation_latency_ms_created Schema validation latency in milliseconds
+# TYPE ingest_validation_latency_ms_created gauge
+ingest_validation_latency_ms_created 1.767884553796925e+09
+# HELP ingest_http_latency_ms End-to-end ingest HTTP latency in milliseconds
+# TYPE ingest_http_latency_ms histogram
+ingest_http_latency_ms_bucket{le="5.0"} 1716.0
+ingest_http_latency_ms_bucket{le="10.0"} 1781.0
+ingest_http_latency_ms_bucket{le="25.0"} 1787.0
+ingest_http_latency_ms_bucket{le="50.0"} 1787.0
+ingest_http_latency_ms_bucket{le="100.0"} 1787.0
+ingest_http_latency_ms_bucket{le="250.0"} 1792.0
+ingest_http_latency_ms_bucket{le="500.0"} 1792.0
+ingest_http_latency_ms_bucket{le="1000.0"} 1792.0
+ingest_http_latency_ms_bucket{le="2500.0"} 1792.0
+ingest_http_latency_ms_bucket{le="5000.0"} 1792.0
+ingest_http_latency_ms_bucket{le="+Inf"} 1792.0
+ingest_http_latency_ms_count 1792.0
+ingest_http_latency_ms_sum 4219.735499922535
+# HELP ingest_http_latency_ms_created End-to-end ingest HTTP latency in milliseconds
+# TYPE ingest_http_latency_ms_created gauge
+ingest_http_latency_ms_created 1.7678845537969801e+09
+
+After resetting and running replayer again for some time:
+C:\Users\ishaan256185>curl http://127.0.0.1:8000/metrics
+# HELP ingest_requests_total Total number of ingest HTTP requests received
+# TYPE ingest_requests_total counter
+ingest_requests_total 3092.0
+# HELP ingest_requests_created Total number of ingest HTTP requests received
+# TYPE ingest_requests_created gauge
+ingest_requests_created 1.76788455379687e+09
+# HELP ingest_rows_accepted_total Total number of rows accepted for Kafka production
+# TYPE ingest_rows_accepted_total counter
+ingest_rows_accepted_total 1321.0
+# HELP ingest_rows_accepted_created Total number of rows accepted for Kafka production
+# TYPE ingest_rows_accepted_created gauge
+ingest_rows_accepted_created 1.7678845537968898e+09
+# HELP ingest_rows_rejected_total Total number of rows rejected by ingest service
+# TYPE ingest_rows_rejected_total counter
+ingest_rows_rejected_total 1771.0
+# HELP ingest_rows_rejected_created Total number of rows rejected by ingest service
+# TYPE ingest_rows_rejected_created gauge
+ingest_rows_rejected_created 1.7678845537969027e+09
+# HELP ingest_validation_latency_ms Schema validation latency in milliseconds
+# TYPE ingest_validation_latency_ms histogram
+ingest_validation_latency_ms_bucket{le="1.0"} 3092.0
+ingest_validation_latency_ms_bucket{le="5.0"} 3092.0
+ingest_validation_latency_ms_bucket{le="10.0"} 3092.0
+ingest_validation_latency_ms_bucket{le="25.0"} 3092.0
+ingest_validation_latency_ms_bucket{le="50.0"} 3092.0
+ingest_validation_latency_ms_bucket{le="100.0"} 3092.0
+ingest_validation_latency_ms_bucket{le="250.0"} 3092.0
+ingest_validation_latency_ms_bucket{le="500.0"} 3092.0
+ingest_validation_latency_ms_bucket{le="1000.0"} 3092.0
+ingest_validation_latency_ms_bucket{le="+Inf"} 3092.0
+ingest_validation_latency_ms_count 3092.0
+ingest_validation_latency_ms_sum 0.1462716002133675
+# HELP ingest_validation_latency_ms_created Schema validation latency in milliseconds
+# TYPE ingest_validation_latency_ms_created gauge
+ingest_validation_latency_ms_created 1.767884553796925e+09
+# HELP ingest_http_latency_ms End-to-end ingest HTTP latency in milliseconds
+# TYPE ingest_http_latency_ms histogram
+ingest_http_latency_ms_bucket{le="5.0"} 3016.0
+ingest_http_latency_ms_bucket{le="10.0"} 3081.0
+ingest_http_latency_ms_bucket{le="25.0"} 3087.0
+ingest_http_latency_ms_bucket{le="50.0"} 3087.0
+ingest_http_latency_ms_bucket{le="100.0"} 3087.0
+ingest_http_latency_ms_bucket{le="250.0"} 3092.0
+ingest_http_latency_ms_bucket{le="500.0"} 3092.0
+ingest_http_latency_ms_bucket{le="1000.0"} 3092.0
+ingest_http_latency_ms_bucket{le="2500.0"} 3092.0
+ingest_http_latency_ms_bucket{le="5000.0"} 3092.0
+ingest_http_latency_ms_bucket{le="+Inf"} 3092.0
+ingest_http_latency_ms_count 3092.0
+ingest_http_latency_ms_sum 4333.832999996957
+# HELP ingest_http_latency_ms_created End-to-end ingest HTTP latency in milliseconds
+# TYPE ingest_http_latency_ms_created gauge
+ingest_http_latency_ms_created 1.7678845537969801e+09
