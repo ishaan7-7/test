@@ -1,0 +1,241 @@
+kafka metrics:
+
+from typing import Dict, Any
+import requests
+import re
+
+# Regex to capture: kafka_rows_per_vehicle{vehicle_id="sim001"} 125.0
+VEHICLE_ROW_PATTERN = re.compile(r'kafka_rows_per_vehicle\{vehicle_id="([^"]+)"\}\s+(\d+\.?\d*)')
+
+def fetch_kafka_metrics(metrics_url: str) -> Dict[str, Any]:
+    # Initialize with an empty vehicles dict so the key always exists
+    snapshot: Dict[str, Any] = {"vehicles": {}}
+
+    try:
+        resp = requests.get(metrics_url, timeout=2)
+        resp.raise_for_status()
+    except Exception:
+        return snapshot
+
+    for line in resp.text.splitlines():
+        if not line or line.startswith("#"):
+            continue
+
+        # 1. Check for Vehicle specific metrics first
+        v_match = VEHICLE_ROW_PATTERN.search(line)
+        if v_match:
+            v_id, v_val = v_match.groups()
+            snapshot["vehicles"][v_id] = float(v_val)
+            continue
+
+        # 2. Fallback to standard "Key Value" parsing for everything else
+        try:
+            name, value = line.split(" ", 1)
+            snapshot[name] = float(value)
+        except Exception:
+            continue
+
+    return snapshot
+
+state.py
+
+import time
+from threading import Lock
+from typing import Dict, Any, Callable
+
+class DashboardState:
+    """
+    In-memory, TTL-based snapshot cache for dashboard metrics.
+    """
+
+    def __init__(
+        self,
+        *,
+        replay_fetcher: Callable[[], Dict[str, Any]],
+        ingest_fetcher: Callable[[], Dict[str, Any]],
+        kafka_fetcher: Callable[[], Dict[str, Any]],
+        ttl_seconds: int = 5,
+    ):
+        self._replay_fetcher = replay_fetcher
+        self._ingest_fetcher = ingest_fetcher
+        self._kafka_fetcher = kafka_fetcher
+        self._ttl_seconds = ttl_seconds
+
+        self._lock = Lock()
+        self._last_refresh_ts: float = 0.0
+
+        self._replay_metrics: Dict[str, Any] = {}
+        self._ingest_metrics: Dict[str, Any] = {}
+        self._kafka_metrics: Dict[str, Any] = {}
+
+    # -------------------------------------------------
+    # Internal refresh logic
+    # -------------------------------------------------
+    def _needs_refresh(self) -> bool:
+        return (time.monotonic() - self._last_refresh_ts) >= self._ttl_seconds
+
+    def _refresh(self) -> None:
+        self._replay_metrics = self._replay_fetcher() or {}
+        self._ingest_metrics = self._ingest_fetcher() or {}
+        self._kafka_metrics = self._kafka_fetcher() or {}
+        self._last_refresh_ts = time.monotonic()
+
+    # -------------------------------------------------
+    # Public read API
+    # -------------------------------------------------
+    def replay_metrics(self) -> Dict[str, Any]:
+        with self._lock:
+            if self._needs_refresh():
+                self._refresh()
+            return dict(self._replay_metrics)
+
+    def ingest_metrics(self) -> Dict[str, Any]:
+        with self._lock:
+            if self._needs_refresh():
+                self._refresh()
+            return dict(self._ingest_metrics)
+
+    def kafka_metrics(self) -> Dict[str, Any]:
+        with self._lock:
+            if self._needs_refresh():
+                self._refresh()
+            return dict(self._kafka_metrics)
+
+    def vehicle_metrics(self) -> Dict[str, float]:
+        """
+        Helper to extract just the vehicle dictionary from the Kafka metrics.
+        """
+        with self._lock:
+            if self._needs_refresh():
+                self._refresh()
+            # Return the nested 'vehicles' dict we created in the adapter
+            return self._kafka_metrics.get("vehicles", {})
+
+    def snapshot(self) -> Dict[str, Dict[str, Any]]:
+        with self._lock:
+            if self._needs_refresh():
+                self._refresh()
+
+            return {
+                "replay": dict(self._replay_metrics),
+                "ingest": dict(self._ingest_metrics),
+                "kafka": dict(self._kafka_metrics),
+            }
+
+# Global singleton slot
+dashboard_state: "DashboardState | None" = None
+
+vehicles.py
+
+from fastapi import APIRouter, Depends, HTTPException
+from fastapi.responses import JSONResponse
+from dashboard.app.dependencies import get_dashboard_state
+
+router = APIRouter()
+
+@router.get("/vehicles")
+def list_vehicles(state=Depends(get_dashboard_state)):
+    # Fetch the dict: {"sim001": 150.0, "sim002": 300.0}
+    data = state.vehicle_metrics()
+    
+    # Convert to a list of objects for the frontend
+    vehicle_list = [
+        {"vehicle_id": v_id, "rows_processed": count}
+        for v_id, count in data.items()
+    ]
+    
+    # Sort for consistent display
+    vehicle_list.sort(key=lambda x: x["vehicle_id"])
+
+    return JSONResponse(content={"vehicles": vehicle_list})
+
+@router.get("/vehicles/{vehicle_id}")
+def vehicle_detail(vehicle_id: str, state=Depends(get_dashboard_state)):
+    data = state.vehicle_metrics()
+    
+    if vehicle_id not in data:
+        return JSONResponse(
+            status_code=404,
+            content={"error": f"Vehicle {vehicle_id} not found in active stream"}
+        )
+
+    return JSONResponse(
+        content={
+            "vehicle_id": vehicle_id,
+            "rows_processed": data[vehicle_id],
+            "status": "active"
+        }
+    )
+
+
+main.py
+
+# dashboard/app/main.py
+from fastapi import FastAPI
+from fastapi.responses import JSONResponse
+from pathlib import Path
+
+from dashboard.app.config_loader import DashboardConfig
+# Import the global state module to assign the singleton
+import dashboard.app.state as global_state
+from dashboard.app.state import DashboardState
+
+from dashboard.app.adapters.replay_metrics import fetch_replay_metrics
+from dashboard.app.adapters.ingest_metrics import fetch_ingest_metrics
+from dashboard.app.adapters.kafka_metrics import fetch_kafka_metrics
+
+# Import routers
+from dashboard.app.routes.overview import router as overview_router
+from dashboard.app.routes.replay import router as replay_router
+from dashboard.app.routes.ingest import router as ingest_router
+from dashboard.app.routes.kafka import router as kafka_router
+from dashboard.app.routes.vehicles import router as vehicles_router
+
+
+app = FastAPI(
+    title="Telemetry Dashboard",
+    version="1.0",
+    description="Read-only dashboard for replay, ingest, and Kafka layers",
+)
+
+
+@app.on_event("startup")
+def init_dashboard_state() -> None:
+    config = DashboardConfig(
+        Path("dashboard/config/dashboard_config.json")
+    )
+
+    # Initialize the state object
+    state = DashboardState(
+        replay_fetcher=lambda: fetch_replay_metrics(
+            config.replay_metrics_url
+        ),
+        ingest_fetcher=lambda: fetch_ingest_metrics(
+            config.ingest_metrics_url
+        ),
+        kafka_fetcher=lambda: fetch_kafka_metrics(
+            config.kafka_metrics_url
+        ),
+        ttl_seconds=5,
+    )
+    
+    # Assign it to the global variable in the state module
+    global_state.dashboard_state = state
+
+
+# -------------------------------------------------
+# Health
+# -------------------------------------------------
+@app.get("/health")
+def health():
+    return {"status": "ok"}
+
+
+# -------------------------------------------------
+# Layer Routers
+# -------------------------------------------------
+app.include_router(overview_router)
+app.include_router(replay_router)
+app.include_router(ingest_router)
+app.include_router(kafka_router)
+app.include_router(vehicles_router)
