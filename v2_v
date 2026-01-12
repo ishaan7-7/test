@@ -1,414 +1,149 @@
-replay_service.py
+metrics.py
 
+import os
+from prometheus_client import Counter, Gauge, CollectorRegistry, generate_latest
 from pathlib import Path
-from typing import List, Optional
-import threading
-import signal
-import sys
-import time
-import shutil
-from datetime import datetime, timezone
 
-# --- NEW IMPORTS START ---
-from prometheus_client import start_http_server
-# --- NEW IMPORTS END ---
+# Create a custom registry to keep things clean
+REGISTRY = CollectorRegistry()
 
-from replay.service.schema_loader import MasterSchema
-from replay.service.source_discovery import discover_sources
-from replay.service.validator import SchemaValidator
-from replay.service.checkpoint import CheckpointStore
-from replay.service.dlq import DLQWriter
-from replay.service.http_client import HttpClient
-from replay.service.worker import run_worker
-# We must import REGISTRY to expose the correct metrics
-from replay.service.metrics import active_sources, REGISTRY
+# --------------------------------------------------------------------------
+# Existing Global Metrics
+# --------------------------------------------------------------------------
+ingest_rows_received_total = Counter(
+    "ingest_rows_received_total", 
+    "Total rows received by the ingest endpoint", 
+    registry=REGISTRY
+)
 
+ingest_rows_accepted_total = Counter(
+    "ingest_rows_accepted_total", 
+    "Total rows successfully validated and sent to Kafka", 
+    registry=REGISTRY
+)
 
-class ReplayService:
-    def __init__(
-        self,
-        *,
-        pipeline_root: Path,
-        enabled_sims: Optional[List[str]],
-        replay_mode: str,
-        rows_per_second: Optional[float] = None,
-        batch_size: Optional[int] = None,
-        batch_interval_seconds: Optional[float] = None,
-        http_endpoint: str = "http://127.0.0.1:8000/ingest",
-    ):
-        self.pipeline_root = pipeline_root
-        self.enabled_sims = enabled_sims
-        self.replay_mode = replay_mode
-        self.rows_per_second = rows_per_second
-        self.batch_size = batch_size
-        self.batch_interval_seconds = batch_interval_seconds
+ingest_rows_rejected_total = Counter(
+    "ingest_rows_rejected_total", 
+    "Total rows failed validation and sent to DLQ", 
+    registry=REGISTRY
+)
 
-        self._threads: List[threading.Thread] = []
-        self._shutdown_event = threading.Event()
+# --------------------------------------------------------------------------
+# NEW METRICS (For Dashboard v2)
+# --------------------------------------------------------------------------
 
-        # -----------------------------
-        # Core dependencies
-        # -----------------------------
-        self.schema = MasterSchema(
-            pipeline_root / "contracts" / "master.json"
-        )
+# 1. Per-Vehicle Validation Tracker
+# This allows us to calculate "Quality Score" per vehicle.
+# Usage: ingest_rows_validation_detail.labels(vehicle_id="sim001", status="accepted").inc()
+ingest_rows_validation_detail = Counter(
+    "ingest_rows_validation_detail",
+    "Validation status breakdown per vehicle",
+    labelnames=("vehicle_id", "status"),
+    registry=REGISTRY,
+)
 
-        self.schema_validator = SchemaValidator(self.schema)
+# 2. Dead Letter Queue Size
+# This monitors the backlog of bad files.
+dlq_size_files = Gauge(
+    "dlq_size_files", 
+    "Current number of files in the DLQ folder", 
+    registry=REGISTRY
+)
 
-        self.checkpoint_store = CheckpointStore(
-            pipeline_root / "replay" / "checkpoints"
-        )
-
-        self.dlq_writer = DLQWriter(
-            pipeline_root / "replay" / "dlq"
-        )
-
-        self.http_client = HttpClient(endpoint=http_endpoint)
-
-        self.sources = discover_sources(
-            pipeline_root=pipeline_root,
-            schema=self.schema,
-            enabled_sims=enabled_sims,
-        )
-
-    # -------------------------------------------------
-    # Internal thread target
-    # -------------------------------------------------
-    def _run_source(self, source):
-        try:
-            run_worker(
-                source=source,
-                schema_validator=self.schema_validator,
-                checkpoint_store=self.checkpoint_store,
-                dlq_writer=self.dlq_writer,
-                http_client=self.http_client,
-                replay_mode=self.replay_mode,
-                shutdown_event=self._shutdown_event,
-                rows_per_second=self.rows_per_second,
-                batch_size=self.batch_size,
-                batch_interval_seconds=self.batch_interval_seconds,
-            )
-        finally:
-            active_sources.dec()
-
-    # -------------------------------------------------
-    # Lifecycle
-    # -------------------------------------------------
-    def start(self, *, reset: bool = False, archive_dlq: bool = True):
-        # --- NEW: Start Metrics Server on Port 9001 ---
-        # This matches "replay_metrics_url" in your dashboard config.
-        # We pass `registry=REGISTRY` to ensure it serves YOUR custom metrics.
-        try:
-            start_http_server(9001, registry=REGISTRY)
-            print("Replay metrics server started on port 9001")
-        except OSError:
-            print("Warning: Metrics server port 9001 might already be in use.")
-        # ----------------------------------------------
-
-        if reset:
-            self.reset(archive_dlq=archive_dlq)
-
-        self._shutdown_event.clear()
-        active_sources.set(len(self.sources))
-
-        for source in self.sources:
-            t = threading.Thread(
-                target=self._run_source,
-                args=(source,),
-                daemon=True,
-            )
-            self._threads.append(t)
-            t.start()
-
-        self._install_signal_handlers()
-
-    def stop(self):
-        self.stop_workers()
-        sys.exit(0)
-
-    def stop_workers(self):
-        self._shutdown_event.set()
-
-        for t in self._threads:
-            t.join(timeout=10)
-
-        self._threads.clear()
-        active_sources.set(0)
-
-    def wait(self):
-        try:
-            while True:
-                time.sleep(1)
-        except KeyboardInterrupt:
-            self.stop()
-
-    # -------------------------------------------------
-    # Reset
-    # -------------------------------------------------
-    def reset(self, *, archive_dlq: bool = True):
-        self.stop_workers()
-
-        for source in self.sources:
-            self.checkpoint_store.reset(source["source_id"])
-
-        if archive_dlq:
-            dlq_root = self.pipeline_root / "replay" / "dlq"
-            if dlq_root.exists():
-                ts = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
-                archive_dir = dlq_root.parent / f"dlq_archive_{ts}"
-                shutil.move(str(dlq_root), str(archive_dir))
-                dlq_root.mkdir(parents=True, exist_ok=True)
-
-    # -------------------------------------------------
-    # Signals
-    # -------------------------------------------------
-    def _install_signal_handlers(self):
-        def handle_signal(signum, frame):
-            self.stop()
-
-        signal.signal(signal.SIGINT, handle_signal)
-        signal.signal(signal.SIGTERM, handle_signal)
-
-kafka metrics:
-
-from typing import Dict, Any
-import requests
-import re
-
-# Updated Regex:
-# 1. Matches "kafka_rows_per_vehicle" OR "kafka_rows_per_vehicle_total"
-# 2. Captures the vehicle_id inside the braces
-# 3. Captures the numeric value at the end
-VEHICLE_ROW_PATTERN = re.compile(r'kafka_rows_per_vehicle(?:_total)?\{vehicle_id="([^"]+)"\}\s+(\d+\.?\d*)')
-
-def fetch_kafka_metrics(metrics_url: str) -> Dict[str, Any]:
-    # Initialize with an empty vehicles dict so the key always exists
-    snapshot: Dict[str, Any] = {"vehicles": {}}
-
+def update_dlq_size(dlq_path: Path):
+    """
+    Helper function to count files in the DLQ directory and update the gauge.
+    Should be called periodically or on every request.
+    """
     try:
-        resp = requests.get(metrics_url, timeout=2)
-        resp.raise_for_status()
+        if dlq_path.exists():
+            # Count only files, ignore subdirectories if any
+            count = len([f for f in dlq_path.glob("*") if f.is_file()])
+            dlq_size_files.set(count)
+        else:
+            dlq_size_files.set(0)
     except Exception:
-        return snapshot
+        # Fail silently to avoid crashing the main app flow
+        pass
 
-    for line in resp.text.splitlines():
-        if not line or line.startswith("#"):
-            continue
-
-        # 1. Check for Vehicle specific metrics first
-        v_match = VEHICLE_ROW_PATTERN.search(line)
-        if v_match:
-            v_id, v_val = v_match.groups()
-            snapshot["vehicles"][v_id] = float(v_val)
-            continue
-
-        # 2. Fallback to standard "Key Value" parsing for everything else
-        try:
-            name, value = line.split(" ", 1)
-            snapshot[name] = float(value)
-        except Exception:
-            continue
-
-    return snapshot
-state.py
-
-import time
-from threading import Lock
-from typing import Dict, Any, Callable
-
-class DashboardState:
+def export_metrics() -> bytes:
     """
-    In-memory, TTL-based snapshot cache for dashboard metrics.
+    Returns all metrics in Prometheus text format.
     """
-
-    def __init__(
-        self,
-        *,
-        replay_fetcher: Callable[[], Dict[str, Any]],
-        ingest_fetcher: Callable[[], Dict[str, Any]],
-        kafka_fetcher: Callable[[], Dict[str, Any]],
-        ttl_seconds: int = 5,
-    ):
-        self._replay_fetcher = replay_fetcher
-        self._ingest_fetcher = ingest_fetcher
-        self._kafka_fetcher = kafka_fetcher
-        self._ttl_seconds = ttl_seconds
-
-        self._lock = Lock()
-        self._last_refresh_ts: float = 0.0
-
-        self._replay_metrics: Dict[str, Any] = {}
-        self._ingest_metrics: Dict[str, Any] = {}
-        self._kafka_metrics: Dict[str, Any] = {}
-
-    # -------------------------------------------------
-    # Internal refresh logic
-    # -------------------------------------------------
-    def _needs_refresh(self) -> bool:
-        return (time.monotonic() - self._last_refresh_ts) >= self._ttl_seconds
-
-    def _refresh(self) -> None:
-        self._replay_metrics = self._replay_fetcher() or {}
-        self._ingest_metrics = self._ingest_fetcher() or {}
-        self._kafka_metrics = self._kafka_fetcher() or {}
-        self._last_refresh_ts = time.monotonic()
-
-    # -------------------------------------------------
-    # Public read API
-    # -------------------------------------------------
-    def replay_metrics(self) -> Dict[str, Any]:
-        with self._lock:
-            if self._needs_refresh():
-                self._refresh()
-            return dict(self._replay_metrics)
-
-    def ingest_metrics(self) -> Dict[str, Any]:
-        with self._lock:
-            if self._needs_refresh():
-                self._refresh()
-            return dict(self._ingest_metrics)
-
-    def kafka_metrics(self) -> Dict[str, Any]:
-        with self._lock:
-            if self._needs_refresh():
-                self._refresh()
-            return dict(self._kafka_metrics)
-
-    def vehicle_metrics(self) -> Dict[str, float]:
-        """
-        Helper to extract just the vehicle dictionary from the Kafka metrics.
-        """
-        with self._lock:
-            if self._needs_refresh():
-                self._refresh()
-            # Return the nested 'vehicles' dict we created in the adapter
-            return self._kafka_metrics.get("vehicles", {})
-
-    def snapshot(self) -> Dict[str, Dict[str, Any]]:
-        with self._lock:
-            if self._needs_refresh():
-                self._refresh()
-
-            return {
-                "replay": dict(self._replay_metrics),
-                "ingest": dict(self._ingest_metrics),
-                "kafka": dict(self._kafka_metrics),
-            }
-
-# Global singleton slot
-dashboard_state: "DashboardState | None" = None
-
-vehicles.py
-
-from fastapi import APIRouter, Depends, HTTPException
-from fastapi.responses import JSONResponse
-from dashboard.app.dependencies import get_dashboard_state
-
-router = APIRouter()
-
-@router.get("/vehicles")
-def list_vehicles(state=Depends(get_dashboard_state)):
-    # Fetch the dict: {"sim001": 150.0, "sim002": 300.0}
-    data = state.vehicle_metrics()
-    
-    # Convert to a list of objects for the frontend
-    vehicle_list = [
-        {"vehicle_id": v_id, "rows_processed": count}
-        for v_id, count in data.items()
-    ]
-    
-    # Sort for consistent display
-    vehicle_list.sort(key=lambda x: x["vehicle_id"])
-
-    return JSONResponse(content={"vehicles": vehicle_list})
-
-@router.get("/vehicles/{vehicle_id}")
-def vehicle_detail(vehicle_id: str, state=Depends(get_dashboard_state)):
-    data = state.vehicle_metrics()
-    
-    if vehicle_id not in data:
-        return JSONResponse(
-            status_code=404,
-            content={"error": f"Vehicle {vehicle_id} not found in active stream"}
-        )
-
-    return JSONResponse(
-        content={
-            "vehicle_id": vehicle_id,
-            "rows_processed": data[vehicle_id],
-            "status": "active"
-        }
-    )
+    return generate_latest(REGISTRY)
 
 
 main.py
 
-# dashboard/app/main.py
-from fastapi import FastAPI
-from fastapi.responses import JSONResponse
+
+import os
+from prometheus_client import Counter, Gauge, CollectorRegistry, generate_latest
 from pathlib import Path
 
-from dashboard.app.config_loader import DashboardConfig
-# Import the global state module to assign the singleton
-import dashboard.app.state as global_state
-from dashboard.app.state import DashboardState
+# Create a custom registry to keep things clean
+REGISTRY = CollectorRegistry()
 
-from dashboard.app.adapters.replay_metrics import fetch_replay_metrics
-from dashboard.app.adapters.ingest_metrics import fetch_ingest_metrics
-from dashboard.app.adapters.kafka_metrics import fetch_kafka_metrics
-
-# Import routers
-from dashboard.app.routes.overview import router as overview_router
-from dashboard.app.routes.replay import router as replay_router
-from dashboard.app.routes.ingest import router as ingest_router
-from dashboard.app.routes.kafka import router as kafka_router
-from dashboard.app.routes.vehicles import router as vehicles_router
-
-
-app = FastAPI(
-    title="Telemetry Dashboard",
-    version="1.0",
-    description="Read-only dashboard for replay, ingest, and Kafka layers",
+# --------------------------------------------------------------------------
+# Existing Global Metrics
+# --------------------------------------------------------------------------
+ingest_rows_received_total = Counter(
+    "ingest_rows_received_total", 
+    "Total rows received by the ingest endpoint", 
+    registry=REGISTRY
 )
 
+ingest_rows_accepted_total = Counter(
+    "ingest_rows_accepted_total", 
+    "Total rows successfully validated and sent to Kafka", 
+    registry=REGISTRY
+)
 
-@app.on_event("startup")
-def init_dashboard_state() -> None:
-    config = DashboardConfig(
-        Path("dashboard/config/dashboard_config.json")
-    )
+ingest_rows_rejected_total = Counter(
+    "ingest_rows_rejected_total", 
+    "Total rows failed validation and sent to DLQ", 
+    registry=REGISTRY
+)
 
-    # Initialize the state object
-    state = DashboardState(
-        replay_fetcher=lambda: fetch_replay_metrics(
-            config.replay_metrics_url
-        ),
-        ingest_fetcher=lambda: fetch_ingest_metrics(
-            config.ingest_metrics_url
-        ),
-        kafka_fetcher=lambda: fetch_kafka_metrics(
-            config.kafka_metrics_url
-        ),
-        ttl_seconds=5,
-    )
-    
-    # Assign it to the global variable in the state module
-    global_state.dashboard_state = state
+# --------------------------------------------------------------------------
+# NEW METRICS (For Dashboard v2)
+# --------------------------------------------------------------------------
 
+# 1. Per-Vehicle Validation Tracker
+# This allows us to calculate "Quality Score" per vehicle.
+# Usage: ingest_rows_validation_detail.labels(vehicle_id="sim001", status="accepted").inc()
+ingest_rows_validation_detail = Counter(
+    "ingest_rows_validation_detail",
+    "Validation status breakdown per vehicle",
+    labelnames=("vehicle_id", "status"),
+    registry=REGISTRY,
+)
 
-# -------------------------------------------------
-# Health
-# -------------------------------------------------
-@app.get("/health")
-def health():
-    return {"status": "ok"}
+# 2. Dead Letter Queue Size
+# This monitors the backlog of bad files.
+dlq_size_files = Gauge(
+    "dlq_size_files", 
+    "Current number of files in the DLQ folder", 
+    registry=REGISTRY
+)
 
+def update_dlq_size(dlq_path: Path):
+    """
+    Helper function to count files in the DLQ directory and update the gauge.
+    Should be called periodically or on every request.
+    """
+    try:
+        if dlq_path.exists():
+            # Count only files, ignore subdirectories if any
+            count = len([f for f in dlq_path.glob("*") if f.is_file()])
+            dlq_size_files.set(count)
+        else:
+            dlq_size_files.set(0)
+    except Exception:
+        # Fail silently to avoid crashing the main app flow
+        pass
 
-# -------------------------------------------------
-# Layer Routers
-# -------------------------------------------------
-app.include_router(overview_router)
-app.include_router(replay_router)
-app.include_router(ingest_router)
-app.include_router(kafka_router)
-app.include_router(vehicles_router)
+def export_metrics() -> bytes:
+    """
+    Returns all metrics in Prometheus text format.
+    """
+    return generate_latest(REGISTRY)
