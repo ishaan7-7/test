@@ -4,8 +4,11 @@ from typing import Dict, Any
 import requests
 import re
 
-# Regex to capture: kafka_rows_per_vehicle{vehicle_id="sim001"} 125.0
-VEHICLE_ROW_PATTERN = re.compile(r'kafka_rows_per_vehicle\{vehicle_id="([^"]+)"\}\s+(\d+\.?\d*)')
+# Updated Regex:
+# 1. Matches "kafka_rows_per_vehicle" OR "kafka_rows_per_vehicle_total"
+# 2. Captures the vehicle_id inside the braces
+# 3. Captures the numeric value at the end
+VEHICLE_ROW_PATTERN = re.compile(r'kafka_rows_per_vehicle(?:_total)?\{vehicle_id="([^"]+)"\}\s+(\d+\.?\d*)')
 
 def fetch_kafka_metrics(metrics_url: str) -> Dict[str, Any]:
     # Initialize with an empty vehicles dict so the key always exists
@@ -36,7 +39,6 @@ def fetch_kafka_metrics(metrics_url: str) -> Dict[str, Any]:
             continue
 
     return snapshot
-
 state.py
 
 import time
