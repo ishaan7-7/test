@@ -3,6 +3,7 @@ import sys
 import time
 import socket
 import subprocess
+import shutil
 from pathlib import Path
 
 # --- Configuration ---
@@ -11,6 +12,10 @@ VENV_SCRIPTS = ROOT_DIR / ".venv" / "Scripts"
 
 ZOOKEEPER_BAT = ROOT_DIR / "tools" / "kafka" / "start_zookeeper.bat"
 KAFKA_BAT = ROOT_DIR / "tools" / "kafka" / "start_kafka.bat"
+
+# Default Kafka Log locations on Windows
+KAFKA_LOG_DIR = Path("C:/tmp/kafka-logs")
+ZOOKEEPER_DATA_DIR = Path("C:/tmp/zookeeper")
 
 # Service Definitions
 SERVICES = {
@@ -54,7 +59,6 @@ def wait_for_port(port, service_name, retries=30, delay=1):
 
 def start_new_window(command, title="Service"):
     """Starts a command in a completely new CMD window."""
-    # subprocess.CREATE_NEW_CONSOLE is Windows-specific
     try:
         subprocess.Popen(
             f'start "{title}" {command}', 
@@ -85,6 +89,28 @@ def ask_user(prompt):
         if choice in ['n', 'no']:
             return False
 
+def clean_kafka_logs():
+    """Deletes the C:/tmp logs to fix Windows corruption issues."""
+    print_status("Checking for stale Kafka logs...", "INFO")
+    
+    cleaned = False
+    for path in [KAFKA_LOG_DIR, ZOOKEEPER_DATA_DIR]:
+        if path.exists():
+            try:
+                shutil.rmtree(path)
+                print_status(f"Deleted: {path}", "CLEAN")
+                cleaned = True
+            except PermissionError:
+                print_status(f"Cannot delete {path}. Is Kafka still running?", "ERROR")
+                return False
+            except Exception as e:
+                print_status(f"Error deleting {path}: {e}", "ERROR")
+                return False
+    
+    if not cleaned:
+        print_status("No stale logs found.", "INFO")
+    return True
+
 def main():
     print("========================================")
     print("   Streaming Emulator - Master Runner   ")
@@ -99,6 +125,12 @@ def main():
     else:
         print_status("Activation required to proceed.", "WARN")
         sys.exit(0)
+
+    # --- NEW STEP: Reset Kafka Logs ---
+    # This prevents the "C:\tmp\kafka_logs failed" error
+    if ask_user("Hard Reset Kafka Logs (Fixes corruption/lock issues)"):
+        if not clean_kafka_logs():
+            print_status("Could not clean logs. Please stop existing Java processes manually.", "WARN")
 
     # 2. Start Zookeeper
     if ask_user("Start Zookeeper"):
@@ -115,7 +147,6 @@ def main():
                 print_status("Zookeeper did not start correctly.", "WARN")
 
     # 3. Start Kafka
-    # Only verify Zookeeper is running before asking for Kafka
     if check_port(2181): 
         if ask_user("Start Kafka"):
             if not KAFKA_BAT.exists():
@@ -146,7 +177,6 @@ def main():
             
             if selection in SERVICES:
                 config = SERVICES[selection]
-                # Check if already running
                 if check_port(config['port']):
                     print_status(f"{selection} is already running on port {config['port']}.", "WARN")
                 else:
