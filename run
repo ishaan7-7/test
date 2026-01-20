@@ -3,10 +3,10 @@ import aiohttp
 import json
 import re
 import logging
-import uuid  # <--- NEW IMPORT
-from collections import defaultdict
+import uuid
+from collections import defaultdict, deque
 from typing import Dict, Any, List
-from datetime import datetime
+from datetime import datetime, timezone
 from aiokafka import AIOKafkaConsumer
 from pathlib import Path
 
@@ -20,6 +20,7 @@ except ImportError:
 
 # --- Configuration ---
 INGEST_METRICS_URL = "http://127.0.0.1:8000/metrics"
+HISTORY_LEN = 300  # Store last 300 points (~5 minutes @ 1Hz)
 
 PORTS_TO_CHECK = {
     "Zookeeper": 2181,
@@ -45,18 +46,29 @@ class HybridObserver:
         self.port_health: Dict[str, bool] = {k: False for k in PORTS_TO_CHECK}
         self.global_dlq_size = 0
         
+        # --- Advanced Vehicle Data Structure ---
+        # history: { 
+        #   "engine": { 
+        #       "timestamps": [t1, t2...], 
+        #       "metrics": { "rpm": [1000, 1200...], "temp": [90, 91...] } 
+        #   } 
+        # }
         self.vehicle_data = defaultdict(lambda: {
             "accepted": 0, 
             "rejected": 0, 
             "latency_sum": 0.0, 
             "latency_count": 0,
             "last_seen": 0,
-            "latest_payload": {}
+            "latest_payload": {},
+            "history": defaultdict(lambda: {
+                "timestamps": deque(maxlen=HISTORY_LEN),
+                "metrics": defaultdict(lambda: deque(maxlen=HISTORY_LEN))
+            })
         })
 
     async def start(self):
         self.running = True
-        logger.info("Starting Telemetry Observer Engine...")
+        logger.info("Starting Industrial Observer Engine (History Enabled)...")
         await asyncio.gather(
             self._monitor_ports(),
             self._poll_http_metrics(),
@@ -125,25 +137,22 @@ class HybridObserver:
              self.global_dlq_size = temp_dlq
 
     # ---------------------------------------------------------
-    # Task C: Kafka Listener (UPDATED)
+    # Task C: Kafka Listener (With History Extraction)
     # ---------------------------------------------------------
     async def _consume_kafka_stream(self):
         topics = list(self.ingest_config.topic_mapping.values())
-        
-        # --- FIX: Generate a Random Group ID ---
-        # This ensures every instance gets a FULL copy of the stream
         unique_group_id = f"telemetry-observer-{uuid.uuid4().hex[:8]}"
         
         consumer = AIOKafkaConsumer(
             *topics,
             bootstrap_servers=self.ingest_config.kafka_bootstrap_servers,
-            group_id=unique_group_id, # Use unique ID
+            group_id=unique_group_id, 
             auto_offset_reset="latest"
         )
 
         try:
             await consumer.start()
-            logger.info(f"Observer connected with Group ID: {unique_group_id}")
+            logger.info(f"Observer connected to topics: {topics}")
             
             async for msg in consumer:
                 if not self.running: break
@@ -151,31 +160,44 @@ class HybridObserver:
                     payload = json.loads(msg.value)
                     meta = payload.get("metadata", {})
                     v_id = meta.get("vehicle_id")
+                    module = meta.get("module", "unknown")
                     ingest_ts_str = meta.get("ingest_ts")
+                    data_body = payload.get("data", {})
                     
+                    # Latency Logic
                     latency_ms = 0.0
+                    now_utc = datetime.now(timezone.utc)
                     if ingest_ts_str:
                         ts = datetime.fromisoformat(ingest_ts_str)
-                        if ts.tzinfo is None:
-                            now = datetime.utcnow()
-                        else:
-                            from datetime import timezone
-                            now = datetime.now(timezone.utc)
-                        latency_ms = (now - ts).total_seconds() * 1000
+                        if ts.tzinfo is None: ts = ts.replace(tzinfo=timezone.utc)
+                        latency_ms = (now_utc - ts).total_seconds() * 1000
                         if latency_ms < 0: latency_ms = 0
 
                     if v_id:
                         async with self.lock:
                             entry = self.vehicle_data[v_id]
+                            
+                            # 1. Standard Stats
                             entry["accepted"] += 1
                             entry["latency_sum"] += latency_ms
                             entry["latency_count"] += 1
                             entry["last_seen"] = asyncio.get_event_loop().time()
                             entry["latest_payload"] = payload
+                            
+                            # 2. History Recording
+                            # We record the arrival time for the X-axis
+                            arrival_time_str = now_utc.strftime("%H:%M:%S")
+                            
+                            mod_history = entry["history"][module]
+                            mod_history["timestamps"].append(arrival_time_str)
+                            
+                            # Auto-detect numeric fields and store them
+                            for key, value in data_body.items():
+                                if isinstance(value, (int, float)) and not isinstance(value, bool):
+                                    mod_history["metrics"][key].append(value)
+                                    
                 except Exception:
                     pass
-        except Exception as e:
-            logger.error(f"Kafka Connection Failed: {e}")
         finally:
             await consumer.stop()
 
@@ -190,7 +212,6 @@ class HybridObserver:
             total_rows = 0
             current_time = asyncio.get_event_loop().time()
 
-            # Convert dict to sorted list
             sorted_keys = sorted(self.vehicle_data.keys())
 
             for v_id in sorted_keys:
@@ -198,7 +219,6 @@ class HybridObserver:
                 acc = data["accepted"]
                 rej = data["rejected"]
                 total = acc + rej
-                
                 val_rate = (acc / total * 100.0) if total > 0 else 100.0
                 
                 v_lat_avg = 0.0
@@ -209,6 +229,15 @@ class HybridObserver:
                 
                 ago = round(current_time - data["last_seen"], 1)
 
+                # Serialize History (Deque -> List) for JSON/UI
+                # Structure: history[module][metrics][key] = [1, 2, 3]
+                clean_history = {}
+                for mod, h_data in data["history"].items():
+                    clean_history[mod] = {
+                        "timestamps": list(h_data["timestamps"]),
+                        "metrics": {k: list(v) for k, v in h_data["metrics"].items()}
+                    }
+
                 vehicle_list.append({
                     "vehicle_id": v_id,
                     "rows_processed": acc,
@@ -216,7 +245,8 @@ class HybridObserver:
                     "validation_rate": round(val_rate, 1),
                     "avg_latency": round(v_lat_avg, 1),
                     "last_seen_sec": ago,
-                    "latest_payload": data["latest_payload"]
+                    "latest_payload": data["latest_payload"],
+                    "history": clean_history  # <--- New Field
                 })
                 total_rows += acc
 
@@ -237,12 +267,21 @@ if __name__ == "__main__":
     async def test_runner():
         observer = HybridObserver()
         asyncio.create_task(observer.start())
-        print("--- Observer Started (Press Ctrl+C to stop) ---")
+        print("--- Observer Started (History Enabled) ---")
         try:
             while True:
                 await asyncio.sleep(5)
                 snap = await observer.get_snapshot()
-                print(f"Active Vehicles: {[v['vehicle_id'] for v in snap['vehicles']]}")
+                if snap['vehicles']:
+                    v1 = snap['vehicles'][0]
+                    print(f"Vehicle: {v1['vehicle_id']}")
+                    print(f"Modules with History: {list(v1['history'].keys())}")
+                    # Print Sample History
+                    for mod in v1['history']:
+                        met = v1['history'][mod]['metrics']
+                        if met:
+                            k = list(met.keys())[0]
+                            print(f"  - {mod}.{k}: {met[k][-5:]} (Last 5)")
         except KeyboardInterrupt:
             await observer.stop()
 
