@@ -1,254 +1,277 @@
-import streamlit as st
-import pandas as pd
 import asyncio
-import threading
-import time
-import plotly.express as px
-import plotly.graph_objects as go
+import aiohttp
+import json
+import re
+import logging
+import uuid
+from collections import defaultdict, deque
+from typing import Dict, Any, List
+from datetime import datetime, timezone
+from aiokafka import AIOKafkaConsumer
 from pathlib import Path
-import sys
 
-# --- Path Setup ---
-CURRENT_DIR = Path(__file__).resolve().parent
-ROOT_DIR = CURRENT_DIR.parent
-if str(ROOT_DIR) not in sys.path:
-    sys.path.append(str(ROOT_DIR))
+# --- Import Existing Config ---
+try:
+    from ingest.app.config_loader import IngestConfig
+except ImportError:
+    import sys
+    sys.path.append(str(Path.cwd()))
+    from ingest.app.config_loader import IngestConfig
 
-# Import the Engine (Phase 1)
-from telemetry_observer.observer_backend import HybridObserver
+# --- Configuration ---
+INGEST_METRICS_URL = "http://127.0.0.1:8000/metrics"
+HISTORY_LEN = 300  # Store last 300 points (~5 minutes @ 1Hz)
 
-# ---------------------------------------------------------
-# Page Configuration
-# ---------------------------------------------------------
-st.set_page_config(
-    page_title="Telemetry Command Center",
-    page_icon="📡",
-    layout="wide",
-    initial_sidebar_state="expanded"
-)
+PORTS_TO_CHECK = {
+    "Zookeeper": 2181,
+    "Kafka": 9092,
+    "Ingest": 8000,
+    "Replay": 9001,
+    "Kafka Metrics": 9201,
+    "Dashboard": 9300
+}
 
-# Custom CSS for Industrial Look
-st.markdown("""
-<style>
-    .status-box {
-        padding: 8px; border-radius: 4px; text-align: center; 
-        font-weight: 600; color: white; margin-bottom: 5px; font-size: 0.85em;
-        box-shadow: 0 2px 4px rgba(0,0,0,0.1);
-    }
-    .status-up { background-color: #2e7d32; } /* Dark Green */
-    .status-down { background-color: #c62828; } /* Dark Red */
-    .metric-card {
-        background-color: #1e1e1e; padding: 15px; border-radius: 8px;
-        border-left: 5px solid #00acc1; margin-bottom: 10px;
-    }
-    div[data-testid="stMetricValue"] { font-size: 24px; color: #e0e0e0; }
-    div[data-testid="stMetricLabel"] { font-size: 14px; color: #9e9e9e; }
-</style>
-""", unsafe_allow_html=True)
+VALIDATION_REGEX = re.compile(r'ingest_rows_validation_detail(?:_total)?\{.*vehicle_id="([^"]+)".*status="([^"]+)".*\}\s+(\d+\.?\d*)')
+DLQ_GAUGE_REGEX = re.compile(r'dlq_size_files\s+(\d+\.?\d*)')
 
-# ---------------------------------------------------------
-# Singleton Pattern: Background Engine
-# ---------------------------------------------------------
-@st.cache_resource
-def get_running_observer():
-    observer = HybridObserver()
-    def start_loop():
-        loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(loop)
-        loop.run_until_complete(observer.start())
-    t = threading.Thread(target=start_loop, daemon=True)
-    t.start()
-    time.sleep(1) # Warmup
-    return observer
+logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
+logger = logging.getLogger("ObserverEngine")
 
-observer = get_running_observer()
-
-# Fetch Data
-loop = asyncio.new_event_loop()
-asyncio.set_event_loop(loop)
-snapshot = loop.run_until_complete(observer.get_snapshot())
-
-# ---------------------------------------------------------
-# TOP BAR: SYSTEM STATUS
-# ---------------------------------------------------------
-st.title("📡 Telemetry Command Center")
-
-ports = snapshot.get("system_health", {})
-if ports:
-    cols = st.columns(len(ports))
-    for idx, (service_name, is_up) in enumerate(ports.items()):
-        status_class = "status-up" if is_up else "status-down"
-        icon = "ACTIVE" if is_up else "OFFLINE"
-        with cols[idx]:
-            st.markdown(
-                f'<div class="status-box {status_class}">{service_name}<br><small>{icon}</small></div>', 
-                unsafe_allow_html=True
-            )
-
-st.markdown("---")
-
-# ---------------------------------------------------------
-# GLOBAL KPIS
-# ---------------------------------------------------------
-stats = snapshot.get("global_stats", {})
-k1, k2, k3, k4 = st.columns(4)
-
-with k1: st.metric("Total Throughput", f"{stats.get('total_rows', 0):,}", help="Total rows processed since startup")
-with k2: st.metric("Active Fleet Size", stats.get("active_vehicles", 0), help="Unique vehicles sending data")
-with k3: 
-    lat = stats.get("avg_latency", 0)
-    st.metric("Global Latency", f"{lat} ms", delta_color="inverse")
-with k4: 
-    dlq = stats.get("dlq_backlog", 0)
-    st.metric("DLQ Backlog", dlq, delta_color="inverse", help="Failed messages on disk")
-
-# ---------------------------------------------------------
-# MAIN INTERFACE (TABS)
-# ---------------------------------------------------------
-vehicles = snapshot.get("vehicles", [])
-
-if vehicles:
-    df = pd.DataFrame(vehicles)
-    
-    # We now have 4 Tabs
-    tab1, tab2, tab3, tab4 = st.tabs([
-        "🏆 Leaderboard", 
-        "📊 Fleet Analytics", 
-        "🛠️ Module Forensics", # <-- NEW TAB
-        "🔍 Live Inspector"
-    ])
-
-    # --- TAB 1: LEADERBOARD ---
-    with tab1:
-        display_df = df[[
-            "vehicle_id", "rows_processed", "rejected_rows", 
-            "validation_rate", "avg_latency", "last_seen_sec"
-        ]].copy()
+class HybridObserver:
+    def __init__(self):
+        self.ingest_config = IngestConfig(Path("ingest/config/ingest_config.json"))
+        self.lock = asyncio.Lock()
+        self.running = False
         
-        st.dataframe(
-            display_df,
-            column_config={
-                "vehicle_id": "Vehicle ID",
-                "rows_processed": st.column_config.NumberColumn("Rows", format="%d"),
-                "validation_rate": st.column_config.ProgressColumn(
-                    "Quality Score", format="%.1f%%", min_value=0, max_value=100
-                ),
-                "avg_latency": st.column_config.NumberColumn("Latency", format="%.1f ms"),
-                "last_seen_sec": st.column_config.NumberColumn("Last Seen", format="%.1f s")
-            },
-            use_container_width=True,
-            hide_index=True
+        self.port_health: Dict[str, bool] = {k: False for k in PORTS_TO_CHECK}
+        self.global_dlq_size = 0
+        
+        self.vehicle_data = defaultdict(lambda: {
+            "accepted": 0, 
+            "rejected": 0, 
+            "latency_sum": 0.0, 
+            "latency_count": 0,
+            "last_seen": 0,
+            "latest_payload": {},      # The very last packet received (Any Module)
+            "module_payloads": {},     # NEW: { "engine": {...}, "tyre": {...} }
+            "history": defaultdict(lambda: {
+                "timestamps": deque(maxlen=HISTORY_LEN),
+                "metrics": defaultdict(lambda: deque(maxlen=HISTORY_LEN))
+            })
+        })
+
+    async def start(self):
+        self.running = True
+        logger.info("Starting Industrial Observer Engine (Module Inspector Enabled)...")
+        await asyncio.gather(
+            self._monitor_ports(),
+            self._poll_http_metrics(),
+            self._consume_kafka_stream()
         )
 
-    # --- TAB 2: FLEET ANALYTICS ---
-    with tab2:
-        c1, c2 = st.columns(2)
-        with c1:
-            st.subheader("Latency Heatmap")
-            fig_lat = px.bar(
-                df, x="vehicle_id", y="avg_latency", 
-                color="avg_latency", color_continuous_scale="RdYlGn_r",
-                labels={"avg_latency": "Latency (ms)"}
-            )
-            st.plotly_chart(fig_lat, use_container_width=True)
-            
-        with c2:
-            st.subheader("Data Quality Distribution")
-            chart_data = df.melt(id_vars="vehicle_id", value_vars=["rows_processed", "rejected_rows"], var_name="Type", value_name="Count")
-            fig_qual = px.bar(
-                chart_data, x="vehicle_id", y="Count", color="Type",
-                color_discrete_map={"rows_processed": "#2e7d32", "rejected_rows": "#c62828"},
-                barmode="stack"
-            )
-            st.plotly_chart(fig_qual, use_container_width=True)
+    async def stop(self):
+        self.running = False
+        logger.info("Stopping Observer Engine.")
 
-    # --- TAB 3: MODULE FORENSICS (THE NEW INDUSTRIAL UPGRADE) ---
-    with tab3:
-        # Selector
-        v_ids = sorted(df["vehicle_id"].tolist())
-        col_sel1, col_sel2 = st.columns([1, 3])
-        
-        with col_sel1:
-            selected_v_forensics = st.selectbox("Select Vehicle:", v_ids, key="forensics_v")
-        
-        # Get Data for Vehicle
-        v_data = next((v for v in vehicles if v["vehicle_id"] == selected_v_forensics), None)
-        
-        if v_data and "history" in v_data and v_data["history"]:
-            # Module Selector
-            available_modules = list(v_data["history"].keys())
+    # ---------------------------------------------------------
+    # Task A: Port Scanner
+    # ---------------------------------------------------------
+    async def _monitor_ports(self):
+        while self.running:
+            results = {}
+            for name, port in PORTS_TO_CHECK.items():
+                try:
+                    _, writer = await asyncio.wait_for(
+                        asyncio.open_connection("127.0.0.1", port), timeout=0.2
+                    )
+                    writer.close()
+                    await writer.wait_closed()
+                    results[name] = True
+                except:
+                    results[name] = False
             
-            with col_sel1:
-                selected_mod = st.radio("Select Module:", available_modules)
+            async with self.lock:
+                self.port_health = results
+            await asyncio.sleep(2)
+
+    # ---------------------------------------------------------
+    # Task B: HTTP Metrics Poller
+    # ---------------------------------------------------------
+    async def _poll_http_metrics(self):
+        async with aiohttp.ClientSession() as session:
+            while self.running:
+                try:
+                    async with session.get(INGEST_METRICS_URL, timeout=1) as resp:
+                        if resp.status == 200:
+                            text = await resp.text()
+                            self._parse_metrics(text)
+                except Exception:
+                    pass
+                await asyncio.sleep(1)
+
+    def _parse_metrics(self, text: str):
+        lines = text.splitlines()
+        temp_dlq = 0
+        for line in lines:
+            if line.startswith("#"): continue
             
-            with col_sel2:
-                # Retrieve History
-                mod_hist = v_data["history"][selected_mod]
-                timestamps = mod_hist["timestamps"]
-                metrics = mod_hist["metrics"]
+            v_match = VALIDATION_REGEX.search(line)
+            if v_match:
+                v_id, status, val = v_match.groups()
+                count = int(float(val))
+                if status == "rejected":
+                    self.vehicle_data[v_id]["rejected"] = count
+                continue
+
+            d_match = DLQ_GAUGE_REGEX.search(line)
+            if d_match:
+                temp_dlq = int(float(d_match.group(1)))
+        
+        if self.running:
+             self.global_dlq_size = temp_dlq
+
+    # ---------------------------------------------------------
+    # Task C: Kafka Listener
+    # ---------------------------------------------------------
+    async def _consume_kafka_stream(self):
+        topics = list(self.ingest_config.topic_mapping.values())
+        unique_group_id = f"telemetry-observer-{uuid.uuid4().hex[:8]}"
+        
+        consumer = AIOKafkaConsumer(
+            *topics,
+            bootstrap_servers=self.ingest_config.kafka_bootstrap_servers,
+            group_id=unique_group_id, 
+            auto_offset_reset="latest"
+        )
+
+        try:
+            await consumer.start()
+            logger.info(f"Observer connected to topics: {topics}")
+            
+            async for msg in consumer:
+                if not self.running: break
+                try:
+                    payload = json.loads(msg.value)
+                    meta = payload.get("metadata", {})
+                    v_id = meta.get("vehicle_id")
+                    module = meta.get("module", "unknown")
+                    ingest_ts_str = meta.get("ingest_ts")
+                    data_body = payload.get("data", {})
+                    
+                    # Latency Logic
+                    latency_ms = 0.0
+                    now_utc = datetime.now(timezone.utc)
+                    if ingest_ts_str:
+                        ts = datetime.fromisoformat(ingest_ts_str)
+                        if ts.tzinfo is None: ts = ts.replace(tzinfo=timezone.utc)
+                        latency_ms = (now_utc - ts).total_seconds() * 1000
+                        if latency_ms < 0: latency_ms = 0
+
+                    if v_id:
+                        async with self.lock:
+                            entry = self.vehicle_data[v_id]
+                            
+                            # 1. Standard Stats
+                            entry["accepted"] += 1
+                            entry["latency_sum"] += latency_ms
+                            entry["latency_count"] += 1
+                            entry["last_seen"] = asyncio.get_event_loop().time()
+                            entry["latest_payload"] = payload
+                            
+                            # 2. NEW: Store Module Specific Payload
+                            entry["module_payloads"][module] = payload
+
+                            # 3. History Recording
+                            arrival_time_str = now_utc.strftime("%H:%M:%S")
+                            mod_history = entry["history"][module]
+                            mod_history["timestamps"].append(arrival_time_str)
+                            
+                            for key, value in data_body.items():
+                                if isinstance(value, (int, float)) and not isinstance(value, bool):
+                                    mod_history["metrics"][key].append(value)
+                                    
+                except Exception:
+                    pass
+        finally:
+            await consumer.stop()
+
+    # ---------------------------------------------------------
+    # Public API: Get Snapshot
+    # ---------------------------------------------------------
+    async def get_snapshot(self) -> Dict[str, Any]:
+        async with self.lock:
+            vehicle_list = []
+            global_lat_sum = 0.0
+            global_lat_count = 0
+            total_rows = 0
+            current_time = asyncio.get_event_loop().time()
+
+            sorted_keys = sorted(self.vehicle_data.keys())
+
+            for v_id in sorted_keys:
+                data = self.vehicle_data[v_id]
+                acc = data["accepted"]
+                rej = data["rejected"]
+                total = acc + rej
+                val_rate = (acc / total * 100.0) if total > 0 else 100.0
                 
-                if not metrics:
-                    st.warning("No numeric metrics found in this module yet.")
-                else:
-                    st.subheader(f"Analyzing: {selected_v_forensics} ➡️ {selected_mod.upper()}")
-                    
-                    # 1. KPI ROW (Latest Values)
-                    kpi_cols = st.columns(min(len(metrics), 4))
-                    for idx, (metric_name, values) in enumerate(metrics.items()):
-                        if idx < 4:
-                            latest_val = values[-1] if values else 0
-                            with kpi_cols[idx]:
-                                st.metric(metric_name.replace("_", " ").title(), f"{latest_val}")
-                    
-                    st.markdown("---")
-                    
-                    # 2. TREND CHARTS (Plotly)
-                    # We group metrics into charts. 
-                    # If we have many metrics, we put them on separate charts or combine compatible ones.
-                    # For simplicity: One chart per metric for maximum clarity.
-                    
-                    for metric_name, values in metrics.items():
-                        # Create Dataframe for Plotly
-                        # Ensure lengths match (ring buffer might have slight offset during high speed updates)
-                        min_len = min(len(timestamps), len(values))
-                        chart_df = pd.DataFrame({
-                            "Time": timestamps[-min_len:],
-                            "Value": values[-min_len:]
-                        })
-                        
-                        fig = px.line(
-                            chart_df, x="Time", y="Value", 
-                            title=f"{metric_name.replace('_', ' ').title()} Over Time",
-                            markers=False
-                        )
-                        fig.update_traces(line_color='#00acc1', line_width=2)
-                        fig.update_layout(
-                            paper_bgcolor="rgba(0,0,0,0)",
-                            plot_bgcolor="rgba(0,0,0,0)",
-                            height=250,
-                            margin=dict(l=20, r=20, t=30, b=20)
-                        )
-                        st.plotly_chart(fig, use_container_width=True)
+                v_lat_avg = 0.0
+                if data["latency_count"] > 0:
+                    v_lat_avg = data["latency_sum"] / data["latency_count"]
+                    global_lat_sum += data["latency_sum"]
+                    global_lat_count += data["latency_count"]
+                
+                ago = round(current_time - data["last_seen"], 1)
 
-        else:
-            st.info("Waiting for history data to populate... (Requires Replay Running)")
+                clean_history = {}
+                for mod, h_data in data["history"].items():
+                    clean_history[mod] = {
+                        "timestamps": list(h_data["timestamps"]),
+                        "metrics": {k: list(v) for k, v in h_data["metrics"].items()}
+                    }
 
+                vehicle_list.append({
+                    "vehicle_id": v_id,
+                    "rows_processed": acc,
+                    "rejected_rows": rej,
+                    "validation_rate": round(val_rate, 1),
+                    "avg_latency": round(v_lat_avg, 1),
+                    "last_seen_sec": ago,
+                    "latest_payload": data["latest_payload"],
+                    "module_payloads": data["module_payloads"], # <--- Sending to UI
+                    "history": clean_history
+                })
+                total_rows += acc
 
-    # --- TAB 4: LIVE INSPECTOR ---
-    with tab4:
-        # Selector
-        selected_v = st.selectbox("Inspect Vehicle:", v_ids, key="inspect_v")
-        
-        if selected_v:
-            v_data = next((v for v in vehicles if v["vehicle_id"] == selected_v), None)
-            if v_data:
-                # Raw JSON
-                st.caption("Latest Raw Payload")
-                st.json(v_data.get("latest_payload", {}), expanded=True)
+            global_avg_lat = (global_lat_sum / global_lat_count) if global_lat_count > 0 else 0.0
 
-else:
-    st.info("🚀 Waiting for Telemetry Stream... Please start your Replay Service!")
+            return {
+                "system_health": dict(self.port_health),
+                "global_stats": {
+                    "total_rows": total_rows,
+                    "active_vehicles": len(vehicle_list),
+                    "avg_latency": round(global_avg_lat, 1),
+                    "dlq_backlog": self.global_dlq_size
+                },
+                "vehicles": vehicle_list
+            }
 
-# Auto-Refresh
-time.sleep(1)
-st.rerun()
+if __name__ == "__main__":
+    async def test_runner():
+        observer = HybridObserver()
+        asyncio.create_task(observer.start())
+        print("--- Observer Started ---")
+        try:
+            while True:
+                await asyncio.sleep(5)
+                snap = await observer.get_snapshot()
+                if snap['vehicles']:
+                    v1 = snap['vehicles'][0]
+                    print(f"Vehicle: {v1['vehicle_id']} | Modules: {list(v1['module_payloads'].keys())}")
+        except KeyboardInterrupt:
+            await observer.stop()
+
+    try:
+        asyncio.run(test_runner())
+    except KeyboardInterrupt:
+        pass
