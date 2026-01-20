@@ -1,315 +1,217 @@
+import streamlit as st
+import pandas as pd
 import asyncio
-import aiohttp
-import json
-import re
-import logging
-from collections import defaultdict
-from typing import Dict, Any, List
-from datetime import datetime
-from aiokafka import AIOKafkaConsumer
+import threading
+import time
 from pathlib import Path
+import sys
 
-# --- Import Existing Config ---
-# We use the existing loader so we don't hardcode ports/topics
-try:
-    from ingest.app.config_loader import IngestConfig
-except ImportError:
-    # Fallback if run incorrectly, but instructions will ensure correct path
-    import sys
-    sys.path.append(str(Path.cwd()))
-    from ingest.app.config_loader import IngestConfig
+# --- Path Setup ---
+# Add the root directory to sys.path so we can import from telemetry_observer and ingest
+CURRENT_DIR = Path(__file__).resolve().parent
+ROOT_DIR = CURRENT_DIR.parent
+if str(ROOT_DIR) not in sys.path:
+    sys.path.append(str(ROOT_DIR))
 
-# --- Configuration ---
-INGEST_METRICS_URL = "http://127.0.0.1:8000/metrics"
-
-# Service Ports to Monitor
-PORTS_TO_CHECK = {
-    "Zookeeper": 2181,
-    "Kafka": 9092,
-    "Ingest": 8000,
-    "Replay": 9001,
-    "Kafka Metrics": 9201,
-    "Dashboard": 9300
-}
-
-# Regex to parse Prometheus Text Format
-# Matches: ingest_rows_validation_detail_total{status="rejected",vehicle_id="sim001"} 5.0
-VALIDATION_REGEX = re.compile(r'ingest_rows_validation_detail(?:_total)?\{.*vehicle_id="([^"]+)".*status="([^"]+)".*\}\s+(\d+\.?\d*)')
-# Matches: dlq_size_files 12.0
-DLQ_GAUGE_REGEX = re.compile(r'dlq_size_files\s+(\d+\.?\d*)')
-
-# Configure Logging
-logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
-logger = logging.getLogger("ObserverEngine")
-
-class HybridObserver:
-    def __init__(self):
-        # Load existing config to get Kafka bootstrap & topics
-        self.ingest_config = IngestConfig(Path("ingest/config/ingest_config.json"))
-        
-        self.lock = asyncio.Lock()
-        self.running = False
-        
-        # --- Shared State ---
-        self.port_health: Dict[str, bool] = {k: False for k in PORTS_TO_CHECK}
-        self.global_dlq_size = 0
-        
-        # Vehicle Data Structure:
-        # { "sim001": { "accepted": 0, "rejected": 0, "latency_sum": 0.0, ... } }
-        self.vehicle_data = defaultdict(lambda: {
-            "accepted": 0, 
-            "rejected": 0, 
-            "latency_sum": 0.0, 
-            "latency_count": 0,
-            "last_seen": 0,
-            "latest_payload": {}
-        })
-
-    async def start(self):
-        """Starts all background monitoring tasks."""
-        self.running = True
-        logger.info("Starting Telemetry Observer Engine...")
-        
-        await asyncio.gather(
-            self._monitor_ports(),
-            self._poll_http_metrics(),
-            self._consume_kafka_stream()
-        )
-
-    async def stop(self):
-        """Stops the engine."""
-        self.running = False
-        logger.info("Stopping Observer Engine.")
-
-    # ---------------------------------------------------------
-    # Task A: Port Scanner
-    # ---------------------------------------------------------
-    async def _monitor_ports(self):
-        while self.running:
-            results = {}
-            for name, port in PORTS_TO_CHECK.items():
-                try:
-                    # Attempt a quick TCP handshake
-                    _, writer = await asyncio.wait_for(
-                        asyncio.open_connection("127.0.0.1", port), timeout=0.2
-                    )
-                    writer.close()
-                    await writer.wait_closed()
-                    results[name] = True
-                except:
-                    results[name] = False
-            
-            async with self.lock:
-                self.port_health = results
-            
-            await asyncio.sleep(2)  # Check every 2 seconds
-
-    # ---------------------------------------------------------
-    # Task B: HTTP Metrics Poller (Quality & DLQ)
-    # ---------------------------------------------------------
-    async def _poll_http_metrics(self):
-        async with aiohttp.ClientSession() as session:
-            while self.running:
-                try:
-                    async with session.get(INGEST_METRICS_URL, timeout=1) as resp:
-                        if resp.status == 200:
-                            text = await resp.text()
-                            self._parse_metrics(text)
-                except Exception:
-                    # Ingest service might be down, just ignore this poll
-                    pass
-                
-                await asyncio.sleep(1) # Poll every 1 second
-
-    def _parse_metrics(self, text: str):
-        """Parses the raw Prometheus text from Ingest."""
-        temp_dlq = 0
-        
-        # We parse line by line
-        lines = text.splitlines()
-        for line in lines:
-            if line.startswith("#"): continue
-            
-            # 1. Check for Validation Details
-            v_match = VALIDATION_REGEX.search(line)
-            if v_match:
-                v_id, status, val = v_match.groups()
-                count = int(float(val))
-                
-                # Update specific field based on status label
-                if status == "rejected":
-                    self.vehicle_data[v_id]["rejected"] = count
-                elif status == "accepted":
-                    # We usually trust Kafka for accepted, but this is a good cross-check
-                    # We won't overwrite Kafka count here to avoid race conditions, 
-                    # but we could use it for reconciliation if needed.
-                    pass
-                continue
-
-            # 2. Check for DLQ Size
-            d_match = DLQ_GAUGE_REGEX.search(line)
-            if d_match:
-                temp_dlq = int(float(d_match.group(1)))
-        
-        # Commit to state (thread-safe)
-        if self.running: # Check again before locking
-             # Note: We use a sync update here since we are inside a callback/loop
-             # But accessing self.vehicle_data should technically be locked if accessed across threads.
-             # Since asyncio is single-threaded cooperative multitasking, this is generally safe 
-             # between awaits, but we use explicit lock for good measure.
-             pass # Logic moved to async lock below isn't needed for simple dict updates in asyncio
-             
-             self.global_dlq_size = temp_dlq
-
-    # ---------------------------------------------------------
-    # Task C: Kafka Listener (Latency & Live Data)
-    # ---------------------------------------------------------
-    async def _consume_kafka_stream(self):
-        # We subscribe to ALL topics found in the config
-        topics = list(self.ingest_config.topic_mapping.values())
-        
-        consumer = AIOKafkaConsumer(
-            *topics,
-            bootstrap_servers=self.ingest_config.kafka_bootstrap_servers,
-            group_id="telemetry-observer-phase1",
-            auto_offset_reset="latest"
-        )
-
-        try:
-            await consumer.start()
-            logger.info(f"Observer connected to Kafka topics: {topics}")
-            
-            async for msg in consumer:
-                if not self.running: break
-                
-                try:
-                    payload = json.loads(msg.value)
-                    meta = payload.get("metadata", {})
-                    v_id = meta.get("vehicle_id")
-                    ingest_ts_str = meta.get("ingest_ts")
-                    
-                    # --- Latency Calculation ---
-                    latency_ms = 0.0
-                    if ingest_ts_str:
-                        # Parse ISO format: 2026-01-20T10:00:00.123456+00:00
-                        ts = datetime.fromisoformat(ingest_ts_str)
-                        # Ensure we compare UTC to UTC
-                        if ts.tzinfo is None:
-                            now = datetime.utcnow()
-                        else:
-                            from datetime import timezone
-                            now = datetime.now(timezone.utc)
-                            
-                        latency_ms = (now - ts).total_seconds() * 1000
-                        if latency_ms < 0: latency_ms = 0
-
-                    # --- Update State ---
-                    if v_id:
-                        async with self.lock:
-                            entry = self.vehicle_data[v_id]
-                            entry["accepted"] += 1
-                            entry["latency_sum"] += latency_ms
-                            entry["latency_count"] += 1
-                            entry["last_seen"] = asyncio.get_event_loop().time()
-                            entry["latest_payload"] = payload
-
-                except Exception as e:
-                    # Malformed message in stream
-                    pass
-        except Exception as e:
-            logger.error(f"Kafka Connection Failed: {e}")
-        finally:
-            await consumer.stop()
-
-    # ---------------------------------------------------------
-    # Public API: Get Snapshot
-    # ---------------------------------------------------------
-    async def get_snapshot(self) -> Dict[str, Any]:
-        """Returns the fully aggregated state for the UI."""
-        async with self.lock:
-            vehicle_list = []
-            global_lat_sum = 0.0
-            global_lat_count = 0
-            total_rows = 0
-
-            current_time = asyncio.get_event_loop().time()
-
-            for v_id, data in self.vehicle_data.items():
-                acc = data["accepted"]
-                rej = data["rejected"]
-                total = acc + rej
-                
-                # Validation Rate
-                val_rate = (acc / total * 100.0) if total > 0 else 100.0
-                
-                # Avg Latency for this vehicle
-                v_lat_avg = 0.0
-                if data["latency_count"] > 0:
-                    v_lat_avg = data["latency_sum"] / data["latency_count"]
-                    global_lat_sum += data["latency_sum"]
-                    global_lat_count += data["latency_count"]
-                
-                # Last Seen (Seconds ago)
-                ago = round(current_time - data["last_seen"], 1)
-
-                vehicle_list.append({
-                    "vehicle_id": v_id,
-                    "rows_processed": acc,
-                    "rejected_rows": rej,
-                    "validation_rate": round(val_rate, 1),
-                    "avg_latency": round(v_lat_avg, 1),
-                    "last_seen_sec": ago,
-                    "latest_payload": data["latest_payload"]
-                })
-                
-                total_rows += acc
-
-            # Global Averages
-            global_avg_lat = (global_lat_sum / global_lat_count) if global_lat_count > 0 else 0.0
-
-            return {
-                "system_health": dict(self.port_health),
-                "global_stats": {
-                    "total_rows": total_rows,
-                    "active_vehicles": len(vehicle_list),
-                    "avg_latency": round(global_avg_lat, 1),
-                    "dlq_backlog": self.global_dlq_size
-                },
-                "vehicles": vehicle_list
-            }
+# Import the Engine from Phase 1
+from telemetry_observer.observer_backend import HybridObserver
 
 # ---------------------------------------------------------
-# VERIFICATION TEST RUNNER
+# Page Configuration
 # ---------------------------------------------------------
-if __name__ == "__main__":
-    # This block allows you to run the file directly to test Phase 1
-    async def test_runner():
-        observer = HybridObserver()
-        asyncio.create_task(observer.start())
+st.set_page_config(
+    page_title="Telemetry Observer",
+    page_icon="📡",
+    layout="wide",
+    initial_sidebar_state="expanded"
+)
+
+# Custom CSS for Status Indicators
+st.markdown("""
+<style>
+    .status-box {
+        padding: 8px;
+        border-radius: 5px;
+        text-align: center;
+        font-weight: bold;
+        color: white;
+        margin-bottom: 5px;
+        font-size: 0.9em;
+    }
+    .status-up { background-color: #28a745; }
+    .status-down { background-color: #dc3545; }
+    div[data-testid="stMetricValue"] { font-size: 20px; }
+</style>
+""", unsafe_allow_html=True)
+
+# ---------------------------------------------------------
+# Singleton Pattern: Start Engine in Background
+# ---------------------------------------------------------
+@st.cache_resource
+def get_running_observer():
+    """
+    Instantiates the HybridObserver and runs its async start() method
+    in a dedicated background thread.
+    """
+    observer = HybridObserver()
+    
+    def start_loop():
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        loop.run_until_complete(observer.start())
+
+    # Start the observer in a daemon thread so it doesn't block UI
+    t = threading.Thread(target=start_loop, daemon=True)
+    t.start()
+    
+    # Give it a moment to initialize
+    time.sleep(1)
+    return observer
+
+observer = get_running_observer()
+
+# ---------------------------------------------------------
+# Data Fetching
+# ---------------------------------------------------------
+# Since the observer runs in a thread, we just need to call the sync/async wrapper
+# The get_snapshot is async, so we run it in the main streamlit loop
+loop = asyncio.new_event_loop()
+asyncio.set_event_loop(loop)
+snapshot = loop.run_until_complete(observer.get_snapshot())
+
+# ---------------------------------------------------------
+# SECTION 1: Mission Control (System Health)
+# ---------------------------------------------------------
+st.title("📡 Telemetry Observer")
+
+# A. Status Bar (Ports)
+ports = snapshot.get("system_health", {})
+if ports:
+    cols = st.columns(len(ports))
+    for idx, (service_name, is_up) in enumerate(ports.items()):
+        status_class = "status-up" if is_up else "status-down"
+        icon = "✅" if is_up else "❌"
+        with cols[idx]:
+            st.markdown(
+                f'<div class="status-box {status_class}">{icon} {service_name}</div>', 
+                unsafe_allow_html=True
+            )
+
+st.markdown("---")
+
+# B. Global KPIs
+stats = snapshot.get("global_stats", {})
+
+k1, k2, k3, k4 = st.columns(4)
+with k1: 
+    st.metric("Total Rows Processed", f"{stats.get('total_rows', 0):,}")
+with k2: 
+    st.metric("Active Vehicles", stats.get("active_vehicles", 0))
+with k3: 
+    lat = stats.get("avg_latency", 0)
+    st.metric("Global Avg Latency", f"{lat} ms", delta_color="inverse")
+with k4: 
+    dlq = stats.get("dlq_backlog", 0)
+    st.metric("DLQ Backlog", dlq, delta_color="inverse")
+
+# ---------------------------------------------------------
+# SECTION 2 & 3: Analytics & Leaderboard
+# ---------------------------------------------------------
+vehicles = snapshot.get("vehicles", [])
+
+if vehicles:
+    # Prepare DataFrame
+    df = pd.DataFrame(vehicles)
+    
+    # Create Tabs
+    tab1, tab2, tab3 = st.tabs(["🏆 Leaderboard", "📊 Fleet Analytics", "🔍 Live Inspector"])
+
+    # --- Tab 1: Leaderboard ---
+    with tab1:
+        # We format the dataframe for display
+        display_df = df[[
+            "vehicle_id", "rows_processed", "rejected_rows", 
+            "validation_rate", "avg_latency", "last_seen_sec"
+        ]].copy()
         
-        print("\n--- Observer Engine Started (Press Ctrl+C to stop) ---")
-        print("Waiting for data stream...\n")
+        st.dataframe(
+            display_df,
+            column_config={
+                "vehicle_id": "Vehicle ID",
+                "rows_processed": "Rows",
+                "rejected_rows": "Rejected",
+                "validation_rate": st.column_config.ProgressColumn(
+                    "Quality %",
+                    help="Percentage of rows accepted",
+                    format="%.1f%%",
+                    min_value=0,
+                    max_value=100,
+                ),
+                "avg_latency": st.column_config.NumberColumn(
+                    "Latency (ms)",
+                    format="%.1f ms"
+                ),
+                "last_seen_sec": st.column_config.NumberColumn(
+                    "Last Seen (s)",
+                    format="%.1f s"
+                )
+            },
+            use_container_width=True,
+            hide_index=True
+        )
+
+    # --- Tab 2: Fleet Analytics (Charts) ---
+    with tab2:
+        c1, c2 = st.columns(2)
         
-        try:
-            while True:
-                await asyncio.sleep(5)
-                snapshot = await observer.get_snapshot()
-                
-                print(f"--- Snapshot at {datetime.now().strftime('%H:%M:%S')} ---")
-                print(f"Ports: {snapshot['system_health']}")
-                print(f"Global: {snapshot['global_stats']}")
-                if snapshot['vehicles']:
-                    print(f"Vehicles (Top 3):")
-                    for v in snapshot['vehicles'][:3]:
-                        print(f"  - {v['vehicle_id']}: Rate={v['validation_rate']}% | Latency={v['avg_latency']}ms | Payload={v['latest_payload'] != {}}")
+        with c1:
+            st.subheader("Latency Heatmap")
+            # Bar chart of Latency per Vehicle
+            st.bar_chart(df.set_index("vehicle_id")["avg_latency"], color="#FFA500")
+            
+        with c2:
+            st.subheader("Quality Distribution")
+            # Stacked bar chart of Rows vs Rejected (Proxy for quality volume)
+            # We create a simple view of Accepted vs Rejected
+            chart_data = df.set_index("vehicle_id")[["rows_processed", "rejected_rows"]]
+            chart_data.columns = ["Accepted", "Rejected"]
+            st.bar_chart(chart_data, color=["#28a745", "#dc3545"])
+
+    # --- Tab 3: Live Inspector ---
+    with tab3:
+        # Selector
+        v_list = df["vehicle_id"].tolist()
+        v_list.sort()
+        selected_v = st.selectbox("Select Vehicle to Inspect:", v_list)
+        
+        if selected_v:
+            # Find data for selected vehicle
+            v_data = next((item for item in vehicles if item["vehicle_id"] == selected_v), None)
+            
+            if v_data:
+                # Health Card
+                hc1, hc2, hc3 = st.columns(3)
+                hc1.info(f"**ID:** {v_data['vehicle_id']}")
+                hc2.success(f"**Accepted:** {v_data['rows_processed']}")
+                if v_data['rejected_rows'] > 0:
+                    hc3.error(f"**Rejected:** {v_data['rejected_rows']}")
                 else:
-                    print("Vehicles: None active")
-                print("-" * 50)
-                
-        except KeyboardInterrupt:
-            await observer.stop()
+                    hc3.success("**Rejected:** 0")
 
-    try:
-        asyncio.run(test_runner())
-    except KeyboardInterrupt:
-        pass
+                # JSON Payload
+                st.caption("Latest Live Payload (Real-time from Kafka)")
+                payload = v_data.get("latest_payload")
+                if payload:
+                    st.json(payload, expanded=True)
+                else:
+                    st.warning("No data packet received yet.")
+            
+else:
+    st.info("Waiting for data stream... Start your Replay Service!")
+
+# ---------------------------------------------------------
+# Auto-Refresh Logic
+# ---------------------------------------------------------
+# This keeps the dashboard live
+time.sleep(1)
+st.rerun()
