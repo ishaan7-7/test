@@ -1,253 +1,315 @@
-import os
-import sys
-import time
-import socket
-import subprocess
-import shutil
+import asyncio
+import aiohttp
 import json
+import re
+import logging
+from collections import defaultdict
+from typing import Dict, Any, List
+from datetime import datetime
+from aiokafka import AIOKafkaConsumer
 from pathlib import Path
 
+# --- Import Existing Config ---
+# We use the existing loader so we don't hardcode ports/topics
+try:
+    from ingest.app.config_loader import IngestConfig
+except ImportError:
+    # Fallback if run incorrectly, but instructions will ensure correct path
+    import sys
+    sys.path.append(str(Path.cwd()))
+    from ingest.app.config_loader import IngestConfig
+
 # --- Configuration ---
-ROOT_DIR = Path(__file__).parent.resolve()
-VENV_SCRIPTS = ROOT_DIR / ".venv" / "Scripts"
+INGEST_METRICS_URL = "http://127.0.0.1:8000/metrics"
 
-# Kafka paths (Adjust if your Kafka is in a different location)
-KAFKA_HOME = Path("C:/kafka")
-KAFKA_BIN = KAFKA_HOME / "bin" / "windows"
-ZOOKEEPER_BAT = ROOT_DIR / "tools" / "kafka" / "start_zookeeper.bat"
-KAFKA_BAT = ROOT_DIR / "tools" / "kafka" / "start_kafka.bat"
-
-# Default Kafka Log locations on Windows
-KAFKA_LOG_DIR = Path("C:/tmp/kafka-logs")
-ZOOKEEPER_DATA_DIR = Path("C:/tmp/zookeeper")
-
-# Topics Config
-INGEST_CONFIG_PATH = ROOT_DIR / "ingest" / "config" / "ingest_config.json"
-
-# Service Definitions
-SERVICES = {
-    "ingest": {
-        "port": 8000,
-        "cmd": "uvicorn ingest.app.main:app --port 8000 --reload"
-    },
-    "kafka_metrics": {
-        "port": 9201,
-        "cmd": "uvicorn kafka_metrics.app.main:app --port 9201 --reload"
-    },
-    "dashboard": {
-        "port": 9300,
-        "cmd": "uvicorn dashboard.app.main:app --port 9300 --reload"
-    }
+# Service Ports to Monitor
+PORTS_TO_CHECK = {
+    "Zookeeper": 2181,
+    "Kafka": 9092,
+    "Ingest": 8000,
+    "Replay": 9001,
+    "Kafka Metrics": 9201,
+    "Dashboard": 9300
 }
 
-def print_status(msg, status="INFO"):
-    print(f"   [{status}] {msg}")
+# Regex to parse Prometheus Text Format
+# Matches: ingest_rows_validation_detail_total{status="rejected",vehicle_id="sim001"} 5.0
+VALIDATION_REGEX = re.compile(r'ingest_rows_validation_detail(?:_total)?\{.*vehicle_id="([^"]+)".*status="([^"]+)".*\}\s+(\d+\.?\d*)')
+# Matches: dlq_size_files 12.0
+DLQ_GAUGE_REGEX = re.compile(r'dlq_size_files\s+(\d+\.?\d*)')
 
-def check_port(port, host="127.0.0.1", timeout=1.0):
-    """Checks if a port is open."""
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-        s.settimeout(timeout)
-        result = s.connect_ex((host, port))
-        return result == 0
+# Configure Logging
+logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
+logger = logging.getLogger("ObserverEngine")
 
-def wait_for_port(port, service_name, retries=30, delay=1):
-    """Waits until a port is open."""
-    print_status(f"Waiting for {service_name} on port {port}...", "WAIT")
-    for _ in range(retries):
-        if check_port(port):
-            print_status(f"{service_name} is listening on port {port}.", "OK")
-            return True
-        time.sleep(delay)
-    print_status(f"Timed out waiting for {service_name}.", "ERROR")
-    return False
+class HybridObserver:
+    def __init__(self):
+        # Load existing config to get Kafka bootstrap & topics
+        self.ingest_config = IngestConfig(Path("ingest/config/ingest_config.json"))
+        
+        self.lock = asyncio.Lock()
+        self.running = False
+        
+        # --- Shared State ---
+        self.port_health: Dict[str, bool] = {k: False for k in PORTS_TO_CHECK}
+        self.global_dlq_size = 0
+        
+        # Vehicle Data Structure:
+        # { "sim001": { "accepted": 0, "rejected": 0, "latency_sum": 0.0, ... } }
+        self.vehicle_data = defaultdict(lambda: {
+            "accepted": 0, 
+            "rejected": 0, 
+            "latency_sum": 0.0, 
+            "latency_count": 0,
+            "last_seen": 0,
+            "latest_payload": {}
+        })
 
-def start_new_window(command, title="Service"):
-    """Starts a command in a completely new CMD window."""
-    try:
-        subprocess.Popen(
-            f'start "{title}" {command}', 
-            shell=True, 
-            creationflags=subprocess.CREATE_NEW_CONSOLE
+    async def start(self):
+        """Starts all background monitoring tasks."""
+        self.running = True
+        logger.info("Starting Telemetry Observer Engine...")
+        
+        await asyncio.gather(
+            self._monitor_ports(),
+            self._poll_http_metrics(),
+            self._consume_kafka_stream()
         )
-        return True
-    except Exception as e:
-        print_status(f"Failed to launch window: {e}", "ERROR")
-        return False
 
-def activate_venv():
-    """Injects venv scripts into PATH for this process and children."""
-    if not VENV_SCRIPTS.exists():
-        print_status("Virtual environment not found at .venv\\Scripts", "ERROR")
-        return False
-    
-    # Prepend venv scripts to PATH
-    os.environ["PATH"] = str(VENV_SCRIPTS) + os.pathsep + os.environ["PATH"]
-    return True
+    async def stop(self):
+        """Stops the engine."""
+        self.running = False
+        logger.info("Stopping Observer Engine.")
 
-def ask_user(prompt):
-    """Simple y/n input."""
-    while True:
-        choice = input(f"\n> {prompt} (y/n): ").strip().lower()
-        if choice in ['y', 'yes']:
-            return True
-        if choice in ['n', 'no']:
-            return False
+    # ---------------------------------------------------------
+    # Task A: Port Scanner
+    # ---------------------------------------------------------
+    async def _monitor_ports(self):
+        while self.running:
+            results = {}
+            for name, port in PORTS_TO_CHECK.items():
+                try:
+                    # Attempt a quick TCP handshake
+                    _, writer = await asyncio.wait_for(
+                        asyncio.open_connection("127.0.0.1", port), timeout=0.2
+                    )
+                    writer.close()
+                    await writer.wait_closed()
+                    results[name] = True
+                except:
+                    results[name] = False
+            
+            async with self.lock:
+                self.port_health = results
+            
+            await asyncio.sleep(2)  # Check every 2 seconds
 
-def clean_kafka_logs():
-    """Deletes the C:/tmp logs to fix Windows corruption issues."""
-    print_status("Checking for stale Kafka logs...", "INFO")
-    
-    cleaned = False
-    for path in [KAFKA_LOG_DIR, ZOOKEEPER_DATA_DIR]:
-        if path.exists():
-            try:
-                shutil.rmtree(path)
-                print_status(f"Deleted: {path}", "CLEAN")
-                cleaned = True
-            except PermissionError:
-                print_status(f"Cannot delete {path}. Is Kafka still running?", "ERROR")
-                return False
-            except Exception as e:
-                print_status(f"Error deleting {path}: {e}", "ERROR")
-                return False
-    
-    if not cleaned:
-        print_status("No stale logs found.", "INFO")
-    return True
+    # ---------------------------------------------------------
+    # Task B: HTTP Metrics Poller (Quality & DLQ)
+    # ---------------------------------------------------------
+    async def _poll_http_metrics(self):
+        async with aiohttp.ClientSession() as session:
+            while self.running:
+                try:
+                    async with session.get(INGEST_METRICS_URL, timeout=1) as resp:
+                        if resp.status == 200:
+                            text = await resp.text()
+                            self._parse_metrics(text)
+                except Exception:
+                    # Ingest service might be down, just ignore this poll
+                    pass
+                
+                await asyncio.sleep(1) # Poll every 1 second
 
-def get_topics_from_config():
-    """Reads topic names from ingest_config.json"""
-    if not INGEST_CONFIG_PATH.exists():
-        print_status("Ingest config not found, skipping topic list.", "WARN")
-        return []
-    
-    try:
-        with open(INGEST_CONFIG_PATH, 'r') as f:
-            data = json.load(f)
-            # Extact values from the "topics" dictionary
-            # e.g. "engine": "telemetry.engine" -> we need "telemetry.engine"
-            return list(data.get("topics", {}).values())
-    except Exception as e:
-        print_status(f"Failed to parse ingest config: {e}", "ERROR")
-        return []
+    def _parse_metrics(self, text: str):
+        """Parses the raw Prometheus text from Ingest."""
+        temp_dlq = 0
+        
+        # We parse line by line
+        lines = text.splitlines()
+        for line in lines:
+            if line.startswith("#"): continue
+            
+            # 1. Check for Validation Details
+            v_match = VALIDATION_REGEX.search(line)
+            if v_match:
+                v_id, status, val = v_match.groups()
+                count = int(float(val))
+                
+                # Update specific field based on status label
+                if status == "rejected":
+                    self.vehicle_data[v_id]["rejected"] = count
+                elif status == "accepted":
+                    # We usually trust Kafka for accepted, but this is a good cross-check
+                    # We won't overwrite Kafka count here to avoid race conditions, 
+                    # but we could use it for reconciliation if needed.
+                    pass
+                continue
 
-def create_topics():
-    """Creates topics using kafka-topics.bat with 6 Partitions"""
-    topics = get_topics_from_config()
-    if not topics:
-        print_status("No topics found in ingest_config.json to create.", "SKIP")
-        return
+            # 2. Check for DLQ Size
+            d_match = DLQ_GAUGE_REGEX.search(line)
+            if d_match:
+                temp_dlq = int(float(d_match.group(1)))
+        
+        # Commit to state (thread-safe)
+        if self.running: # Check again before locking
+             # Note: We use a sync update here since we are inside a callback/loop
+             # But accessing self.vehicle_data should technically be locked if accessed across threads.
+             # Since asyncio is single-threaded cooperative multitasking, this is generally safe 
+             # between awaits, but we use explicit lock for good measure.
+             pass # Logic moved to async lock below isn't needed for simple dict updates in asyncio
+             
+             self.global_dlq_size = temp_dlq
 
-    topic_bat = KAFKA_BIN / "kafka-topics.bat"
-    if not topic_bat.exists():
-        print_status(f"Cannot find kafka-topics.bat at {topic_bat}", "ERROR")
-        print_status("Please check KAFKA_HOME path in run.py", "INFO")
-        return
+    # ---------------------------------------------------------
+    # Task C: Kafka Listener (Latency & Live Data)
+    # ---------------------------------------------------------
+    async def _consume_kafka_stream(self):
+        # We subscribe to ALL topics found in the config
+        topics = list(self.ingest_config.topic_mapping.values())
+        
+        consumer = AIOKafkaConsumer(
+            *topics,
+            bootstrap_servers=self.ingest_config.kafka_bootstrap_servers,
+            group_id="telemetry-observer-phase1",
+            auto_offset_reset="latest"
+        )
 
-    print_status(f"Creating {len(topics)} topics with 6 partitions each...", "INFO")
-    
-    for topic in topics:
-        # Command: kafka-topics.bat --create --topic <name> --partitions 6 --replication-factor 1 --if-not-exists
-        cmd = [
-            str(topic_bat),
-            "--create",
-            "--topic", topic,
-            "--bootstrap-server", "localhost:9092",
-            "--partitions", "6",         # <--- UPDATED TO 6
-            "--replication-factor", "1",
-            "--if-not-exists"
-        ]
+        try:
+            await consumer.start()
+            logger.info(f"Observer connected to Kafka topics: {topics}")
+            
+            async for msg in consumer:
+                if not self.running: break
+                
+                try:
+                    payload = json.loads(msg.value)
+                    meta = payload.get("metadata", {})
+                    v_id = meta.get("vehicle_id")
+                    ingest_ts_str = meta.get("ingest_ts")
+                    
+                    # --- Latency Calculation ---
+                    latency_ms = 0.0
+                    if ingest_ts_str:
+                        # Parse ISO format: 2026-01-20T10:00:00.123456+00:00
+                        ts = datetime.fromisoformat(ingest_ts_str)
+                        # Ensure we compare UTC to UTC
+                        if ts.tzinfo is None:
+                            now = datetime.utcnow()
+                        else:
+                            from datetime import timezone
+                            now = datetime.now(timezone.utc)
+                            
+                        latency_ms = (now - ts).total_seconds() * 1000
+                        if latency_ms < 0: latency_ms = 0
+
+                    # --- Update State ---
+                    if v_id:
+                        async with self.lock:
+                            entry = self.vehicle_data[v_id]
+                            entry["accepted"] += 1
+                            entry["latency_sum"] += latency_ms
+                            entry["latency_count"] += 1
+                            entry["last_seen"] = asyncio.get_event_loop().time()
+                            entry["latest_payload"] = payload
+
+                except Exception as e:
+                    # Malformed message in stream
+                    pass
+        except Exception as e:
+            logger.error(f"Kafka Connection Failed: {e}")
+        finally:
+            await consumer.stop()
+
+    # ---------------------------------------------------------
+    # Public API: Get Snapshot
+    # ---------------------------------------------------------
+    async def get_snapshot(self) -> Dict[str, Any]:
+        """Returns the fully aggregated state for the UI."""
+        async with self.lock:
+            vehicle_list = []
+            global_lat_sum = 0.0
+            global_lat_count = 0
+            total_rows = 0
+
+            current_time = asyncio.get_event_loop().time()
+
+            for v_id, data in self.vehicle_data.items():
+                acc = data["accepted"]
+                rej = data["rejected"]
+                total = acc + rej
+                
+                # Validation Rate
+                val_rate = (acc / total * 100.0) if total > 0 else 100.0
+                
+                # Avg Latency for this vehicle
+                v_lat_avg = 0.0
+                if data["latency_count"] > 0:
+                    v_lat_avg = data["latency_sum"] / data["latency_count"]
+                    global_lat_sum += data["latency_sum"]
+                    global_lat_count += data["latency_count"]
+                
+                # Last Seen (Seconds ago)
+                ago = round(current_time - data["last_seen"], 1)
+
+                vehicle_list.append({
+                    "vehicle_id": v_id,
+                    "rows_processed": acc,
+                    "rejected_rows": rej,
+                    "validation_rate": round(val_rate, 1),
+                    "avg_latency": round(v_lat_avg, 1),
+                    "last_seen_sec": ago,
+                    "latest_payload": data["latest_payload"]
+                })
+                
+                total_rows += acc
+
+            # Global Averages
+            global_avg_lat = (global_lat_sum / global_lat_count) if global_lat_count > 0 else 0.0
+
+            return {
+                "system_health": dict(self.port_health),
+                "global_stats": {
+                    "total_rows": total_rows,
+                    "active_vehicles": len(vehicle_list),
+                    "avg_latency": round(global_avg_lat, 1),
+                    "dlq_backlog": self.global_dlq_size
+                },
+                "vehicles": vehicle_list
+            }
+
+# ---------------------------------------------------------
+# VERIFICATION TEST RUNNER
+# ---------------------------------------------------------
+if __name__ == "__main__":
+    # This block allows you to run the file directly to test Phase 1
+    async def test_runner():
+        observer = HybridObserver()
+        asyncio.create_task(observer.start())
+        
+        print("\n--- Observer Engine Started (Press Ctrl+C to stop) ---")
+        print("Waiting for data stream...\n")
         
         try:
-            result = subprocess.run(cmd, capture_output=True, text=True)
-            if result.returncode == 0:
-                print_status(f"Topic '{topic}': OK (6 Partitions)", "OK")
-            else:
-                if "already exists" in result.stdout:
-                    print_status(f"Topic '{topic}': Already exists", "OK")
+            while True:
+                await asyncio.sleep(5)
+                snapshot = await observer.get_snapshot()
+                
+                print(f"--- Snapshot at {datetime.now().strftime('%H:%M:%S')} ---")
+                print(f"Ports: {snapshot['system_health']}")
+                print(f"Global: {snapshot['global_stats']}")
+                if snapshot['vehicles']:
+                    print(f"Vehicles (Top 3):")
+                    for v in snapshot['vehicles'][:3]:
+                        print(f"  - {v['vehicle_id']}: Rate={v['validation_rate']}% | Latency={v['avg_latency']}ms | Payload={v['latest_payload'] != {}}")
                 else:
-                    print_status(f"Topic '{topic}': FAILED - {result.stderr.strip()}", "ERROR")
-        except Exception as e:
-             print_status(f"Failed to execute topic command: {e}", "ERROR")
+                    print("Vehicles: None active")
+                print("-" * 50)
+                
+        except KeyboardInterrupt:
+            await observer.stop()
 
-def main():
-    print("========================================")
-    print("   Streaming Emulator - Master Runner   ")
-    print("========================================")
-
-    # 1. Activate .venv
-    if ask_user("Activate .venv"):
-        if activate_venv():
-            print_status(".venv activated (injected into process PATH).", "OK")
-        else:
-            sys.exit(1)
-    else:
-        print_status("Activation required to proceed.", "WARN")
-        sys.exit(0)
-
-    # 2. Reset Logs
-    if ask_user("Hard Reset Kafka Logs (Fixes corruption issues)"):
-        if not clean_kafka_logs():
-            print_status("Could not clean logs. Please stop existing Java processes manually.", "WARN")
-
-    # 3. Start Zookeeper
-    if ask_user("Start Zookeeper"):
-        if not ZOOKEEPER_BAT.exists():
-            print_status(f"Missing file: {ZOOKEEPER_BAT}", "ERROR")
-        else:
-            start_new_window(f'"{ZOOKEEPER_BAT}"', title="Zookeeper")
-            if wait_for_port(2181, "Zookeeper", retries=30):
-                print_status("Stabilizing Zookeeper (waiting 5s)...", "WAIT")
-                time.sleep(5)
-                print_status("Zookeeper Ready.", "OK")
-
-    # 4. Start Kafka & Create Topics
-    if check_port(2181): 
-        if ask_user("Start Kafka"):
-            if not KAFKA_BAT.exists():
-                print_status(f"Missing file: {KAFKA_BAT}", "ERROR")
-            else:
-                start_new_window(f'"{KAFKA_BAT}"', title="Kafka")
-                if wait_for_port(9092, "Kafka", retries=60):
-                    print_status("Kafka is Running successfully.", "OK")
-                    
-                    # Ask to create topics
-                    if ask_user("Create Topics (Required after Hard Reset)"):
-                        create_topics()
-    else:
-        print_status("Skipping Kafka (Zookeeper port 2181 not open).", "SKIP")
-
-    # 5. Start Python Services
-    app_list = list(SERVICES.keys())
-    print(f"\nAvailable Apps: {app_list}")
-    
-    start_all = ask_user("Start all apps")
-    
-    if start_all:
-        for name, config in SERVICES.items():
-            print_status(f"Launching {name}...", "INFO")
-            start_new_window(config['cmd'], title=name)
-            wait_for_port(config['port'], name)
-    else:
-        while True:
-            selection = input(f"\nEnter app name from list (or 'exit'): ").strip().lower()
-            if selection == 'exit':
-                break
-            
-            if selection in SERVICES:
-                config = SERVICES[selection]
-                if check_port(config['port']):
-                    print_status(f"{selection} is already running on port {config['port']}.", "WARN")
-                else:
-                    start_new_window(config['cmd'], title=selection)
-                    wait_for_port(config['port'], selection)
-            else:
-                print_status("Invalid app name.", "WARN")
-
-    print("\nAll tasks completed. You may close this launcher.")
-
-if __name__ == "__main__":
     try:
-        main()
+        asyncio.run(test_runner())
     except KeyboardInterrupt:
-        print("\nExiting...")
+        pass
