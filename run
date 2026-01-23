@@ -34,28 +34,30 @@ def setup_environment():
         print(f"❌ STOP: winutils.exe not found at {hadoop_bin}")
         sys.exit(1)
 
-    # 4. OVERRIDE: Spark Home (The Fix for your Crash)
-    # We must force Python to use the Spark libraries inside the .venv, 
-    # ignoring any global Spark installation.
+    # 4. OVERRIDE: Spark Home
     try:
         import pyspark
         venv_spark_home = Path(pyspark.__path__[0])
         os.environ['SPARK_HOME'] = str(venv_spark_home)
-        print(f"✅ Forced SPARK_HOME to .venv: {venv_spark_home}")
     except ImportError:
         print("❌ Could not import pyspark to find its location.")
         sys.exit(1)
 
-    # 5. Inject Environment Variables
-    # Unset conflicting variables if they exist
+    # 5. CRITICAL FIX: Lock Python Workers to .venv
+    # This prevents 'Connection Reset' caused by worker startup failures
+    venv_python = sys.executable  # This gets the python.exe currently running (the .venv one)
+    os.environ['PYSPARK_PYTHON'] = venv_python
+    os.environ['PYSPARK_DRIVER_PYTHON'] = venv_python
+    print(f"✅ Forced Spark Workers to use: {venv_python}")
+
+    # 6. Inject Environment Variables
     if 'PYTHONPATH' in os.environ:
         del os.environ['PYTHONPATH']
         
     os.environ['JAVA_HOME'] = str(jdk_path)
     os.environ['HADOOP_HOME'] = str(hadoop_home)
     
-    # 6. Update System Path
-    # Prepend JDK and Hadoop to PATH
+    # 7. Update System Path
     current_path = os.environ.get('PATH', '')
     new_paths = [
         str(jdk_path / "bin"),
@@ -63,8 +65,6 @@ def setup_environment():
     ]
     os.environ['PATH'] = ";".join(new_paths) + ";" + current_path
 
-    print(f"✅ JAVA_HOME set to: {os.environ['JAVA_HOME']}")
-    print(f"✅ HADOOP_HOME set to: {os.environ['HADOOP_HOME']}")
     print("✅ Infrastructure Ready.\n")
 
 if __name__ == "__main__":
