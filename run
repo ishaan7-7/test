@@ -1,66 +1,204 @@
-# File: C:\streaming_emulator\writer_service\verify_step2.py
+# File: C:\streaming_emulator\writer_service\src\spark_factory.py
 import sys
+from pyspark.sql import SparkSession
 from pathlib import Path
+import logging
 
-# Setup Path to import src modules
+logger = logging.getLogger("SparkFactory")
+
+def get_spark_session(app_name="WriterService"):
+    """
+    Creates a Production-Ready Spark Session with:
+    1. Delta Lake support.
+    2. Local Warehouse (avoids C:/tmp errors).
+    3. Correct Windows/Python 3.13 stability configs.
+    """
+    warehouse_dir = Path("C:/streaming_emulator/data/spark-warehouse")
+    warehouse_dir.mkdir(parents=True, exist_ok=True)
+    
+    # Define Checkpoint Root for reliability
+    checkpoint_root = Path("C:/streaming_emulator/data/checkpoints")
+    checkpoint_root.mkdir(parents=True, exist_ok=True)
+
+    logger.info(f"⚡ Starting Spark Session: {app_name}")
+    
+    spark = SparkSession.builder \
+        .appName(app_name) \
+        .master("local[4]") \
+        .config("spark.driver.host", "127.0.0.1") \
+        .config("spark.driver.bindAddress", "127.0.0.1") \
+        .config("spark.sql.warehouse.dir", str(warehouse_dir.as_uri())) \
+        .config("spark.python.use.daemon", "false") \
+        .config("spark.python.worker.reuse", "false") \
+        .config("spark.sql.execution.arrow.pyspark.enabled", "true") \
+        .config("spark.sql.extensions", "io.delta.sql.DeltaSparkSessionExtension") \
+        .config("spark.sql.catalog.spark_catalog", "org.apache.spark.sql.delta.catalog.DeltaCatalog") \
+        .config("spark.databricks.delta.schema.autoMerge.enabled", "true") \
+        .getOrCreate()
+        
+    return spark
+
+
+# File: C:\streaming_emulator\writer_service\src\stream_processor.py
+import time
+import logging
+from pyspark.sql.functions import from_json, col, current_timestamp
+from infrastructure import setup_environment
+
+# Initialize Environment BEFORE importing Spark
+setup_environment()
+
+from spark_factory import get_spark_session
+from schema_loader import load_all_schemas
+
+# Logging
+logging.basicConfig(level=logging.INFO, format='[%(asctime)s] %(levelname)s: %(message)s')
+logger = logging.getLogger("StreamProcessor")
+
+def run_writer_pipeline():
+    # 1. Start Spark
+    spark = get_spark_session("Phase2_Writer")
+    spark.sparkContext.setLogLevel("WARN")
+
+    # 2. Load Schemas from master.json
+    try:
+        schemas = load_all_schemas()
+    except Exception as e:
+        logger.error(f"Failed to load schemas: {e}")
+        return
+
+    active_streams = []
+
+    # 3. Dynamic Stream Generation
+    # We create one robust stream per module (engine, battery, etc.)
+    for module_name, schema in schemas.items():
+        logger.info(f"🚀 Initializing Stream for Module: {module_name}")
+        
+        # A. Define Inputs/Outputs
+        # We use a specific pattern per module to avoid schema confusion
+        # e.g., subscribe to "sim.*_engine"
+        topic_pattern = f"sim.*_{module_name}"
+        
+        checkpoint_path = f"C:/streaming_emulator/data/checkpoints/writer/{module_name}"
+        output_path = f"C:/streaming_emulator/data/delta/bronze/{module_name}"
+        
+        # B. Read Stream (Kafka)
+        # Note: We assume local Kafka for this emulator.
+        raw_stream = spark.readStream \
+            .format("kafka") \
+            .option("kafka.bootstrap.servers", "localhost:9092") \
+            .option("subscribePattern", topic_pattern) \
+            .option("startingOffsets", "earliest") \
+            .option("failOnDataLoss", "false") \
+            .load()
+
+        # C. Transform & Flatten
+        # 1. Parse JSON
+        # 2. Flatten Metadata (ingest_ts, row_hash)
+        # 3. Add Writer Timestamp (For Phase 2 Latency)
+        # 4. Alias vehicle_id -> source_id (Partition Key)
+        parsed_stream = raw_stream.select(
+            from_json(col("value").cast("string"), schema).alias("parsed")
+        ).select(
+            col("parsed.metadata.row_hash").alias("row_hash"),
+            col("parsed.metadata.ingest_ts").alias("ingest_ts"),
+            current_timestamp().alias("writer_ts"),  # <--- NEW: Writer Latency
+            col("parsed.metadata.vehicle_id").alias("source_id"),
+            col("parsed.data.*") # Flatten all sensor data
+        )
+
+        # D. Deduplicate (Exactly-Once)
+        deduped_stream = parsed_stream.dropDuplicates(["row_hash"])
+
+        # E. Write Stream (Delta Lake)
+        query = deduped_stream.writeStream \
+            .format("delta") \
+            .outputMode("append") \
+            .partitionBy("source_id") \
+            .option("checkpointLocation", checkpoint_path) \
+            .option("mergeSchema", "true") \
+            .start(output_path)
+        
+        active_streams.append(query)
+        logger.info(f"✅ Stream started for {module_name} -> {output_path}")
+
+    # 4. Keep Alive
+    logger.info(f"🔥 All {len(active_streams)} streams active. Waiting for data...")
+    try:
+        spark.streams.awaitAnyTermination()
+    except KeyboardInterrupt:
+        logger.info("🛑 Stopping Writer Service...")
+        for q in active_streams:
+            q.stop()
+
+if __name__ == "__main__":
+    run_writer_pipeline()
+
+
+# File: C:\streaming_emulator\writer_service\verify_step3.py
+import sys
+import time
+from pathlib import Path
+from pyspark.sql.functions import col, expr
+
+# Setup path
 src_path = Path(__file__).parent / "src"
 sys.path.append(str(src_path))
 
-try:
-    import infrastructure
-    import schema_loader
-except ImportError as e:
-    print(f"❌ Import Error: {e}")
-    sys.exit(1)
+from infrastructure import setup_environment
+setup_environment()
+from spark_factory import get_spark_session
 
-print("⏳ Initializing Infrastructure...")
-infrastructure.setup_environment()
+def verify_delta_table(module_name="engine"):
+    print(f"\n🔍 Verifying Delta Table: {module_name}")
+    spark = get_spark_session("Verifier")
+    
+    delta_path = f"C:/streaming_emulator/data/delta/bronze/{module_name}"
+    
+    # 1. Check if Table Exists
+    if not Path(delta_path).exists():
+        print(f"❌ Delta Table not found at {delta_path}")
+        print("   (Did you run the Replay Service and Stream Processor?)")
+        return False
 
-print("\n⏳ Testing Dynamic Schema Generation...")
-try:
-    # Load Schemas
-    schemas = schema_loader.load_all_schemas()
-    
-    # CHECK 1: Module Count
-    expected_modules = ["engine", "battery", "transmission", "tyre", "body"]
-    missing = [m for m in expected_modules if m not in schemas]
-    
-    if missing:
-        print(f"❌ FAILED: Missing schemas for: {missing}")
-        sys.exit(1)
-    print(f"✅ All {len(schemas)} modules loaded.")
+    try:
+        # 2. Read Delta Table
+        df = spark.read.format("delta").load(delta_path)
+        count = df.count()
+        print(f"✅ Table Loaded. Row Count: {count}")
+        
+        if count == 0:
+            print("⚠️ Table is empty. Waiting for streams to process...")
+            return False
 
-    # CHECK 2: Validate 'Engine' Structure
-    engine_schema = schemas['engine']
-    
-    # Verify Root Keys
-    field_names = engine_schema.names
-    if "metadata" in field_names and "data" in field_names:
-        print("✅ Root structure correct (metadata + data)")
-    else:
-        print(f"❌ Root structure incorrect. Found: {field_names}")
-        sys.exit(1)
-
-    # CHECK 3: Metadata & Ingest Timestamp
-    # This specifically checks if your latency requirement is met
-    meta_fields = {f.name: f.dataType for f in engine_schema["metadata"].dataType.fields}
-    
-    if "ingest_ts" in meta_fields:
-        ts_type = str(meta_fields["ingest_ts"])
-        if "TimestampType" in ts_type:
-             print("✅ 'ingest_ts' exists and is TimestampType (Latency tracking ready)")
+        # 3. Check Latency Columns
+        columns = df.columns
+        print(f"   Columns found: {columns[:5]}...")
+        
+        if "ingest_ts" in columns and "writer_ts" in columns:
+            print("✅ Latency Metadata Present (ingest_ts, writer_ts)")
+            
+            # Calculate Avg Latency
+            latency_df = df.withColumn("latency_sec", 
+                col("writer_ts").cast("long") - col("ingest_ts").cast("long")
+            )
+            stats = latency_df.selectExpr("avg(latency_sec) as avg_lat").collect()[0]
+            print(f"   📊 Avg Writer Latency: {stats['avg_lat']:.4f} seconds")
+            
         else:
-             print(f"❌ 'ingest_ts' is wrong type: {ts_type}")
-             sys.exit(1)
-    else:
-        print("❌ Metadata MISSING 'ingest_ts'")
-        sys.exit(1)
+            print("❌ Missing Timestamp Columns!")
+            return False
 
-    # CHECK 4: Data Fields
-    data_struct = engine_schema["data"].dataType
-    print(f"✅ Mapped {len(data_struct.names)} data fields from master.json")
-    
-    print("\n🚀 STEP 2 COMPLETE: Schema Engine is ready.")
+        # 4. Check Partitioning (Source ID)
+        if "source_id" in columns:
+             print("✅ Partition Column 'source_id' exists.")
+        
+        return True
 
-except Exception as e:
-    print(f"\n❌ CRITICAL FAILURE: {e}")
+    except Exception as e:
+        print(f"❌ Error reading Delta table: {e}")
+        return False
+
+if __name__ == "__main__":
+    # Check 'engine' as the default test case
+    verify_delta_table("engine")
