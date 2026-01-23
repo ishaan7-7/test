@@ -1,71 +1,49 @@
-# File: C:\streaming_emulator\writer_service\src\infrastructure.py
-import os
+# File: C:\streaming_emulator\writer_service\verify_step1.py
 import sys
+import shutil
 from pathlib import Path
 
-def setup_environment():
-    """
-    Sets up the portable environment variables for Spark on Windows.
-    Aggressively overrides system defaults to ensure version consistency.
-    """
-    print("🔧 Initializing Portable Spark Infrastructure...")
+# Add 'src' to python path
+src_path = Path(__file__).parent / "src"
+sys.path.append(str(src_path))
 
-    # 1. Locate Project Root
-    current_dir = Path(__file__).parent.absolute()
-    project_root = None
-    for parent in [current_dir] + list(current_dir.parents):
-        if parent.name == "streaming_emulator":
-            project_root = parent
-            break
-    if not project_root:
-        project_root = Path(r"C:\streaming_emulator")
+try:
+    import infrastructure
+    infrastructure.setup_environment()
+except ImportError as e:
+    print(f"❌ CRITICAL: Infrastructure Error: {e}")
+    sys.exit(1)
 
-    # 2. Define Critical Paths
-    tools_dir = project_root / "tools"
-    jdk_path = Path(r"C:\jdk-11.0.28+6")
-    hadoop_home = tools_dir / "hadoop"
-    hadoop_bin = hadoop_home / "bin"
+print("⏳ Starting Spark Session (With Network Fixes)...")
+try:
+    from pyspark.sql import SparkSession
 
-    # 3. Validation
-    if not jdk_path.exists():
-        print(f"❌ STOP: JDK not found at {jdk_path}")
-        sys.exit(1)
-    if not (hadoop_bin / "winutils.exe").exists():
-        print(f"❌ STOP: winutils.exe not found at {hadoop_bin}")
-        sys.exit(1)
+    # Define a local warehouse dir to avoid permission errors in C:\tmp\hive
+    warehouse_dir = Path("C:/streaming_emulator/data/spark-warehouse")
+    warehouse_dir.mkdir(parents=True, exist_ok=True)
 
-    # 4. OVERRIDE: Spark Home
-    try:
-        import pyspark
-        venv_spark_home = Path(pyspark.__path__[0])
-        os.environ['SPARK_HOME'] = str(venv_spark_home)
-    except ImportError:
-        print("❌ Could not import pyspark to find its location.")
-        sys.exit(1)
-
-    # 5. CRITICAL FIX: Lock Python Workers to .venv
-    # This prevents 'Connection Reset' caused by worker startup failures
-    venv_python = sys.executable  # This gets the python.exe currently running (the .venv one)
-    os.environ['PYSPARK_PYTHON'] = venv_python
-    os.environ['PYSPARK_DRIVER_PYTHON'] = venv_python
-    print(f"✅ Forced Spark Workers to use: {venv_python}")
-
-    # 6. Inject Environment Variables
-    if 'PYTHONPATH' in os.environ:
-        del os.environ['PYTHONPATH']
-        
-    os.environ['JAVA_HOME'] = str(jdk_path)
-    os.environ['HADOOP_HOME'] = str(hadoop_home)
+    spark = SparkSession.builder \
+        .appName("InfrastructureVerification") \
+        .master("local[*]") \
+        .config("spark.driver.host", "127.0.0.1") \
+        .config("spark.driver.bindAddress", "127.0.0.1") \
+        .config("spark.sql.warehouse.dir", str(warehouse_dir.as_uri())) \
+        .config("spark.ui.enabled", "false") \
+        .getOrCreate()
     
-    # 7. Update System Path
-    current_path = os.environ.get('PATH', '')
-    new_paths = [
-        str(jdk_path / "bin"),
-        str(hadoop_bin)
-    ]
-    os.environ['PATH'] = ";".join(new_paths) + ";" + current_path
+    print("✅ SparkSession created successfully!")
+    
+    # Run the Task
+    print("⏳ Running distributed task (This tests the Workers)...")
+    data = [("Java", 1), ("Python", 2), ("Scala", 3)]
+    df = spark.createDataFrame(data, ["Language", "ID"])
+    
+    # This .count() triggers the actual 'Job' on the 'Executor'
+    count = df.count()
+    
+    print(f"✅ Task Completed Successfully! Count: {count}")
+    
+    spark.stop()
 
-    print("✅ Infrastructure Ready.\n")
-
-if __name__ == "__main__":
-    setup_environment()
+except Exception as e:
+    print(f"\n❌ SPARK CRASHED: {e}")
