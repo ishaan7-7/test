@@ -1,110 +1,102 @@
-# File: C:\streaming_emulator\writer_service\src\infrastructure.py
-import os
-import sys
-from pathlib import Path
+# File: C:\streaming_emulator\writer_service\src\schema_loader.py
+import json
 import logging
+from pathlib import Path
+from pyspark.sql.types import (
+    StructType, StructField, StringType, DoubleType, 
+    LongType, BooleanType, TimestampType
+)
 
-# Configure basic logging for infrastructure initialization
-logging.basicConfig(level=logging.INFO, format='[%(levelname)s] %(message)s')
-logger = logging.getLogger("InfraSetup")
+# Setup logging
+logger = logging.getLogger("SchemaLoader")
+logger.setLevel(logging.INFO)
 
-def setup_environment():
-    """
-    Sets up the portable environment variables for Apache Spark on Windows.
-    
-    CRITICAL FIXES APPLIED:
-    1. Forces JAVA_HOME and HADOOP_HOME to local portable directories.
-    2. Overrides SPARK_HOME to use the library inside the .venv.
-    3. Forces Spark Workers (PYSPARK_PYTHON) to use the .venv Python executable.
-       (Fixes 'Connection Reset' errors with Python 3.13).
-    4. Updates system PATH to include necessary DLLs (hadoop.dll).
-    """
-    logger.info("🔧 Initializing Portable Spark Infrastructure...")
-
-    # 1. Locate Project Root (Auto-detection)
-    current_dir = Path(__file__).parent.absolute()
-    project_root = None
-    # Traverse up to find the root directory
-    for parent in [current_dir] + list(current_dir.parents):
+def get_project_root():
+    """Finds the root C:/streaming_emulator directory."""
+    current = Path(__file__).parent.absolute()
+    for parent in [current] + list(current.parents):
         if parent.name == "streaming_emulator":
-            project_root = parent
-            break
-    
-    # Fallback if running standalone
-    if not project_root:
-        project_root = Path(r"C:\streaming_emulator")
+            return parent
+    return Path(r"C:\streaming_emulator")
 
-    # 2. Define Critical Paths
-    tools_dir = project_root / "tools"
-    jdk_path = Path(r"C:\jdk-11.0.28+6")
-    hadoop_home = tools_dir / "hadoop"
-    hadoop_bin = hadoop_home / "bin"
-
-    # 3. Validate Dependencies
-    critical_missing = []
-    if not jdk_path.exists():
-        critical_missing.append(f"JDK not found at: {jdk_path}")
-    
-    if not (hadoop_bin / "winutils.exe").exists():
-        critical_missing.append(f"winutils.exe not found at: {hadoop_bin}")
-
-    if critical_missing:
-        for err in critical_missing:
-            logger.error(f"❌ {err}")
-        logger.error("STOPPING: Please fix missing infrastructure dependencies.")
-        sys.exit(1)
-
-    # 4. OVERRIDE: Spark Home & Worker Configuration
-    # This aligns the Spark Engine with the Python Interpreter
-    try:
-        import pyspark
-        venv_spark_home = Path(pyspark.__path__[0])
-        os.environ['SPARK_HOME'] = str(venv_spark_home)
-        logger.info(f"✅ SPARK_HOME set to .venv: {venv_spark_home}")
-    except ImportError:
-        logger.error("❌ Could not import pyspark. Is it installed in the .venv?")
-        sys.exit(1)
-
-    # Fix for Python 3.13 Worker Crashes:
-    # We explicitly tell Spark to use THIS running python executable for workers
-    venv_python = sys.executable
-    os.environ['PYSPARK_PYTHON'] = venv_python
-    os.environ['PYSPARK_DRIVER_PYTHON'] = venv_python
-    
-    # 5. Inject Environment Variables
-    # Clean up conflicting global variables if they exist
-    if 'PYTHONPATH' in os.environ:
-        del os.environ['PYTHONPATH']
-        
-    os.environ['JAVA_HOME'] = str(jdk_path)
-    os.environ['HADOOP_HOME'] = str(hadoop_home)
-    
-    # 6. Update System Path (Prepend to ensure priority)
-    current_path = os.environ.get('PATH', '')
-    new_paths = [
-        str(jdk_path / "bin"),
-        str(hadoop_bin)
-    ]
-    # Only add if not already present to avoid infinite growth on reload
-    if str(hadoop_bin) not in current_path:
-        os.environ['PATH'] = ";".join(new_paths) + ";" + current_path
-
-    logger.info(f"✅ JAVA_HOME: {jdk_path}")
-    logger.info(f"✅ HADOOP_HOME: {hadoop_home}")
-    logger.info("✅ Infrastructure Ready (Production Mode).")
-
-def get_spark_conf_defaults():
+def _map_dtype_to_spark(dtype_str):
     """
-    Returns a dictionary of Spark Configuration keys needed for stability
-    on Windows + Python 3.13. Use this when building SparkSession.
+    Maps Pandas/JSON strings to Spark SQL Types.
     """
-    return {
-        "spark.driver.host": "127.0.0.1",
-        "spark.driver.bindAddress": "127.0.0.1",
-        "spark.python.use.daemon": "false",      # CRITICAL for Py 3.13
-        "spark.python.worker.reuse": "false",    # CRITICAL for Py 3.13
-        "spark.sql.execution.arrow.pyspark.enabled": "true" # Boost performance
+    dtype_str = str(dtype_str).lower()
+    
+    if 'float' in dtype_str:
+        return DoubleType()
+    elif 'int' in dtype_str:
+        return LongType()
+    elif 'bool' in dtype_str:
+        return BooleanType()
+    elif 'datetime' in dtype_str:
+        return TimestampType()
+    else:
+        return StringType()
+
+def load_all_schemas():
+    """
+    Reads contracts/master.json and returns a dictionary of Spark Schemas.
+    
+    Structure Returned:
+    {
+        "engine": StructType([...]),
+        "battery": StructType([...]),
+        ...
     }
+    """
+    root = get_project_root()
+    master_path = root / "contracts" / "master.json"
+    
+    if not master_path.exists():
+        logger.error(f"❌ Contract missing at: {master_path}")
+        raise FileNotFoundError(f"master.json not found at {master_path}")
+
+    try:
+        with open(master_path, 'r') as f:
+            contract = json.load(f)
+            
+        schemas = {}
+        
+        # We iterate over every module defined in master.json (engine, battery, etc.)
+        for module_name, fields in contract.items():
+            
+            # 1. Build the 'data' struct (Dynamic from contract)
+            data_fields = []
+            for col_name, dtype in fields.items():
+                spark_type = _map_dtype_to_spark(dtype)
+                data_fields.append(StructField(col_name, spark_type, True))
+            
+            # 2. Build the 'metadata' struct (Fixed for Protocol)
+            # This captures the Phase 1 Ingest Timestamp for Latency calculations
+            metadata_fields = [
+                StructField("row_hash", StringType(), False),  # Critical for Idempotency
+                StructField("ingest_ts", StringType(), True),  # Sent as ISO String from Phase 1
+                StructField("source_id", StringType(), True),
+                StructField("trace_id", StringType(), True)
+            ]
+            
+            # 3. Construct the Composite Schema expected from Kafka
+            # Payload = { "metadata": {...}, "data": {...} }
+            composite_schema = StructType([
+                StructField("metadata", StructType(metadata_fields), True),
+                StructField("data", StructType(data_fields), True)
+            ])
+            
+            schemas[module_name] = composite_schema
+            logger.debug(f"✅ Loaded schema for: {module_name}")
+            
+        logger.info(f"✅ Successfully loaded {len(schemas)} schemas from master.json")
+        return schemas
+
+    except Exception as e:
+        logger.error(f"❌ Failed to parse master.json: {e}")
+        raise
 
 if __name__ == "__main__":
-    setup_environment()
+    # Quick test when running directly
+    logging.basicConfig()
+    s = load_all_schemas()
+    print("Test Load Complete.")
