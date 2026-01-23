@@ -1,76 +1,54 @@
-# File: C:\streaming_emulator\writer_service\src\infrastructure.py
-import os
+# File: C:\streaming_emulator\writer_service\verify_step1.py
 import sys
 from pathlib import Path
 
-def setup_environment():
-    """
-    Sets up the portable environment variables for Spark on Windows.
-    Must be called BEFORE importing pyspark.
-    """
-    print("🔧 Initializing Portable Spark Infrastructure...")
+# Add 'src' to python path so we can import infrastructure
+src_path = Path(__file__).parent / "src"
+sys.path.append(str(src_path))
 
-    # 1. Define Paths
-    # We assume this script is in writer_service/src/
-    # So project_root is two levels up from writer_service
-    # Adjust logic: We know we are in C:\streaming_emulator\...
-    # Let's find the root 'streaming_emulator' directory
-    current_dir = Path(__file__).parent.absolute()
+# 1. Run Infrastructure Setup
+try:
+    import infrastructure
+    infrastructure.setup_environment()
+except ImportError as e:
+    print(f"❌ CRITICAL: Could not import infrastructure module. Check file placement. Error: {e}")
+    sys.exit(1)
+except SystemExit:
+    print("❌ Verification Failed during Infrastructure Setup.")
+    sys.exit(1)
+
+# 2. Test PySpark Import (This usually fails if Java/Hadoop are wrong)
+print("⏳ Attempting to import PySpark...")
+try:
+    from pyspark.sql import SparkSession
+    print("✅ PySpark imported successfully.")
+except ImportError as e:
+    print(f"❌ Failed to import PySpark. Is it installed in .venv? Error: {e}")
+    sys.exit(1)
+
+# 3. Test Session Creation (The ultimate test for winutils)
+print("⏳ Attempting to start a Spark Session (Local Mode)...")
+try:
+    spark = SparkSession.builder \
+        .appName("InfrastructureVerification") \
+        .master("local[*]") \
+        .getOrCreate()
     
-    # Traverse up until we find 'streaming_emulator' or hit root
-    project_root = None
-    for parent in [current_dir] + list(current_dir.parents):
-        if parent.name == "streaming_emulator":
-            project_root = parent
-            break
-            
-    if not project_root:
-        # Fallback for testing execution
-        project_root = Path(r"C:\streaming_emulator")
-
-    tools_dir = project_root / "tools"
-    jdk_path = Path(r"C:\jdk-11.0.28+6")
-    hadoop_home = tools_dir / "hadoop"
-    hadoop_bin = hadoop_home / "bin"
-
-    # 2. Validation
-    errors = []
-    if not jdk_path.exists():
-        errors.append(f"❌ JDK not found at: {jdk_path}")
+    print("✅ SparkSession created successfully!")
+    print(f"   Spark Version: {spark.version}")
     
-    if not (hadoop_bin / "winutils.exe").exists():
-        errors.append(f"❌ winutils.exe not found at: {hadoop_bin}")
-
-    if not (hadoop_bin / "hadoop.dll").exists():
-        errors.append(f"❌ hadoop.dll not found at: {hadoop_bin}")
-
-    if errors:
-        print("\n".join(errors))
-        print("STOPPING: Please fix the missing dependencies.")
-        sys.exit(1)
-
-    # 3. Inject Environment Variables
-    # Spark needs these to be set in os.environ
-    os.environ['JAVA_HOME'] = str(jdk_path)
-    os.environ['HADOOP_HOME'] = str(hadoop_home)
+    # Simple calculation to prove JVM is working
+    data = [("Java", 1), ("Python", 2)]
+    df = spark.createDataFrame(data, ["Language", "ID"])
+    count = df.count()
+    print(f"   Test DataFrame Count: {count}")
     
-    # 4. Update System Path
-    # We must prepend these to PATH so Windows finds the .dll and .exe
-    current_path = os.environ.get('PATH', '')
-    
-    # Construct new path entries
-    new_paths = [
-        str(jdk_path / "bin"),
-        str(hadoop_bin)
-    ]
-    
-    # Prepend to PATH
-    os.environ['PATH'] = ";".join(new_paths) + ";" + current_path
+    spark.stop()
+    print("✅ Verification Complete. Infrastructure is robust.")
 
-    print(f"✅ JAVA_HOME set to: {os.environ['JAVA_HOME']}")
-    print(f"✅ HADOOP_HOME set to: {os.environ['HADOOP_HOME']}")
-    print("✅ Infrastructure Ready.\n")
-
-if __name__ == "__main__":
-    # Allow running this script directly to test paths
-    setup_environment()
+except Exception as e:
+    print(f"\n❌ SPARK CRASHED: {e}")
+    print("Possible causes:")
+    print("1. JAVA_HOME path is incorrect.")
+    print("2. winutils.exe or hadoop.dll are missing or blocked by antivirus.")
+    print("3. Python version mismatch.")
